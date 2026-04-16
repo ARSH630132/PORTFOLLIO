@@ -58,6 +58,17 @@ export const projects: Project[] = [
     imageUrl: "https://picsum.photos/800/600?random=3",
     position: [4, 0, 0],
   },
+  {
+    id: 4,
+    title: "AI Career Sherpa",
+    description: "AI-driven career path recommender for students.",
+    longDescription: "An intelligent platform that uses LLMs and real-market data to provide personalized career roadmaps and resources for Tier 2/3 city students.",
+    techStack: ["Python", "LangChain", "Llama 3", "FastAPI", "Streamlit"],
+    githubUrl: "https://github.com",
+    liveUrl: "https://example.com",
+    imageUrl: "https://picsum.photos/800/600?random=4",
+    position: [8, 0, 0],
+  },
 ];
 
 export const experiences: Experience[] = [
@@ -108,6 +119,8 @@ export const techStack: Tech[] = [
   { name: "Azure" },
   { name: "Tailwind" },
   { name: "Docker" },
+  { name: "LangChain" },
+  { name: "FastAPI" },
 ];
 
 export const sectionCoordinates = {
