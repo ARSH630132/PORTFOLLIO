@@ -301,29 +301,24 @@ def build_replacement_suggestions(timetable, teacher_data, load_per_day, slot_ti
                     if info["allowed_sections"] and sec not in info["allowed_sections"]:
                         continue
 
-                    # Capacity check (Check if they have at least 1 slot free)
-                    if usage[tname] >= load_per_day:
-                        # If they are already teaching at this exact slot elsewhere, they are not candidates
-                        # But wait, build_replacement_suggestions usually shows who is FREE NOW.
-                        pass
-
                     # Collision check: Must NOT be teaching at this slot i
                     if i in booked[tname]:
                         continue
 
-                    # For suggestions, we might be a bit more relaxed about load,
-                    # but let's stick to strict rules for now.
+                    # Capacity check (Check if they have at least 1 slot free)
                     if usage[tname] < load_per_day:
                         candidates.append(tname)
 
-                suggestions.append({
-                    "day": day,
-                    "slot_label": slot_times[i],
-                    "section": sec,
-                    "subject": subj,
-                    "assigned_teacher": assigned_teacher,
-                    "candidates": candidates
-                })
+                # Filter: Only show if there are candidates available
+                if candidates:
+                    suggestions.append({
+                        "day": day,
+                        "slot_label": slot_times[i],
+                        "section": sec,
+                        "subject": subj,
+                        "assigned_teacher": assigned_teacher,
+                        "candidates": candidates
+                    })
 
     return suggestions
 
@@ -372,7 +367,7 @@ class App:
         ttk.Entry(top, textvariable=self.lunch_var, width=10).grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
         ttk.Label(top, text="Load per day (max slots):").grid(row=2, column=2, sticky="w", padx=10, pady=2)
-        self.load_var = tk.IntVar(value=3)
+        self.load_var = tk.IntVar(value=4)
         ttk.Entry(top, textvariable=self.load_var, width=6).grid(row=2, column=3, sticky="w", padx=5, pady=2)
 
         sep = ttk.Separator(frm, orient="horizontal")
