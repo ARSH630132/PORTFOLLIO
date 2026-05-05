@@ -1,5 +1,8 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+from ttkbootstrap.scrolled import ScrolledFrame
 import random
 from datetime import datetime, timedelta
 
@@ -33,7 +36,6 @@ def get_current_day_usage(timetable, day, sections, slots_count, teacher_data):
     for sec in sections:
         for s in range(slots_count):
             val = timetable[day][sec][s]
-            # val format: "SUBJECT (TEACHER)" or "SUBJECT (TEACHER) [SUB]"
             if "(" in val and ")" in val:
                 try:
                     tname = val.split("(")[-1].split(")")[0].strip()
@@ -65,7 +67,6 @@ def build_timetable(sections, teacher_data, load_per_day, days, slot_times, tech
         random.shuffle(secs_order)
 
         for sec in secs_order:
-            # TECH teacher must be allowed in this section
             candidates = [t for t in tech_teachers if teacher_data[t]["allowed_sections"] and sec in teacher_data[t]["allowed_sections"]]
 
             if not candidates:
@@ -79,17 +80,14 @@ def build_timetable(sections, teacher_data, load_per_day, days, slot_times, tech
                     continue
 
                 for i in range(0, slots_count - 1):
-                    # Check for LUNCH and current timetable status
                     if slot_times[i].upper() == "LUNCH" or slot_times[i+1].upper() == "LUNCH":
                         continue
                     if timetable[day][sec][i] != "FREE" or timetable[day][sec][i+1] != "FREE":
                         continue
 
-                    # Collision check: Teacher 'cand' must be free at slots i and i+1 in ALL sections
                     if i in booked[cand] or (i+1) in booked[cand]:
                         continue
 
-                    # assign
                     timetable[day][sec][i] = f"{tech_subject} ({cand})"
                     timetable[day][sec][i+1] = f"{tech_subject} ({cand})"
 
@@ -100,7 +98,6 @@ def build_timetable(sections, teacher_data, load_per_day, days, slot_times, tech
                 if placed:
                     break
 
-        # 2) Fill remaining slots with non-tech teachers (Strict Rules: includes Gap Rule and Section Mapping)
         for i in range(slots_count):
             if slot_times[i].upper() == "LUNCH":
                 for sec in sections:
@@ -122,19 +119,15 @@ def build_timetable(sections, teacher_data, load_per_day, days, slot_times, tech
                     if subj == tech_subject:
                         continue
 
-                    # 1. Section Mapping Check: Teacher must be allowed to teach this section
                     if info["allowed_sections"] and sec not in info["allowed_sections"]:
                         continue
 
-                    # 2. capacity
                     if usage[tname] >= load_per_day:
                         continue
 
-                    # 3. Collision check: Teacher must be free at slot 'i' (assigned nowhere else)
                     if i in booked[tname]:
                         continue
 
-                    # 4. gap rule: (STRICT RULE) non-tech teacher should not have been assigned at a slot within 2 positions (abs diff <3)
                     if any(abs(i - s) < 3 for s in booked[tname]):
                         continue
 
@@ -149,9 +142,7 @@ def build_timetable(sections, teacher_data, load_per_day, days, slot_times, tech
                 chosen = random.choice(candidates)
                 subj = teacher_data[chosen]["subject"]
 
-                # Assign to current section and dynamically update for next sections/slots
                 timetable[day][sec][i] = f"{subj} ({chosen})"
-
                 usage[chosen] += 1
                 booked[chosen].add(i)
 
@@ -177,18 +168,14 @@ def fill_remaining_free_slots(timetable, teacher_data, load_per_day, slot_times,
                     for tname, info in teacher_data.items():
                         subj = info["subject"]
                         if subj == tech_subject:
-                            # TECH subjects are not assigned in this pass (only Non-TECH)
                             continue
 
-                        # 1. Section Mapping Check: Teacher must be allowed to teach this section
                         if info["allowed_sections"] and sec not in info["allowed_sections"]:
                             continue
 
-                        # 2. Capacity check
                         if usage[tname] >= load_per_day:
                             continue
 
-                        # 3. Collision check (Must be free at this slot, assigned nowhere else)
                         if i in booked[tname]:
                             continue
 
@@ -200,7 +187,6 @@ def fill_remaining_free_slots(timetable, teacher_data, load_per_day, slot_times,
                         chosen = random.choice(candidates)
                         subj = teacher_data[chosen]["subject"]
 
-                        # Assign and update trackers
                         timetable[day][sec][i] = f"{subj} ({chosen})"
                         usage[chosen] += 1
                         booked[chosen].add(i)
@@ -214,44 +200,36 @@ def substitute_absent(timetable, day, absent_teacher, teacher_data, load_per_day
     sections = list(timetable[day].keys())
     slots_count = len(slot_times)
 
-    # Track usage for the day to ensure we don't exceed load_per_day
     usage, booked = get_current_day_usage(timetable, day, sections, slots_count, teacher_data)
 
     for sec in sections:
         for i in range(slots_count):
             val = timetable[day][sec][i]
             if f"({absent_teacher})" in val:
-                # Mark as FREE first so we can find a replacement
                 original_subject = val.split("(")[0].strip()
                 timetable[day][sec][i] = "FREE"
 
-                # Decrement usage for the absent teacher (though they are absent, we just cleared their slot)
                 if absent_teacher in usage:
                     usage[absent_teacher] -= 1
                     booked[absent_teacher].discard(i)
 
-                # Find eligible substitutes
                 eligible = []
                 for tname, info in teacher_data.items():
                     if tname == absent_teacher:
                         continue
 
-                    # Section check
                     if info["allowed_sections"] and sec not in info["allowed_sections"]:
                         continue
 
-                    # Capacity check
                     if usage[tname] >= load_per_day:
                         continue
 
-                    # Collision check
                     if i in booked[tname]:
                         continue
 
                     eligible.append(tname)
 
                 if eligible:
-                    # Prefer same subject
                     same_subject = [t for t in eligible if teacher_data[t]["subject"] == original_subject]
                     if same_subject:
                         chosen = random.choice(same_subject)
@@ -291,25 +269,20 @@ def build_replacement_suggestions(timetable, teacher_data, load_per_day, slot_ti
                 except:
                     continue
 
-                # Find candidates who COULD have taken this slot
                 candidates = []
                 for tname, info in teacher_data.items():
                     if tname == assigned_teacher:
                         continue
 
-                    # Section check
                     if info["allowed_sections"] and sec not in info["allowed_sections"]:
                         continue
 
-                    # Collision check: Must NOT be teaching at this slot i
                     if i in booked[tname]:
                         continue
 
-                    # Capacity check (Check if they have at least 1 slot free)
                     if usage[tname] < load_per_day:
                         candidates.append(tname)
 
-                # Filter: Only show if there are candidates available
                 if candidates:
                     suggestions.append({
                         "day": day,
@@ -322,154 +295,186 @@ def build_replacement_suggestions(timetable, teacher_data, load_per_day, slot_ti
 
     return suggestions
 
-# ---------------- GUI ----------------
+# ---------------- UI Redesign ----------------
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Timetable Scheduler (ALL Teacher-Section Mapping Applied)")
-        root.geometry("1100x750")
+        self.style = tb.Style(theme="flatly")
+        self.root.title("Modern Timetable Scheduler Pro")
+        self.root.geometry("1400x900")
+
+        # Application Colors
+        self.colors = self.style.colors
 
         self._last_timetable = None
         self._last_teacher_data = {}
-        self._last_load = 0
+        self._last_load = 4
         self._last_slot_times = []
 
         self.build_ui()
 
-
     def build_ui(self):
-        frm = ttk.Frame(self.root, padding="10 10 10 10")
-        frm.pack(fill="both", expand=True)
+        # Top Navigation Bar
+        navbar = tb.Frame(self.root, bootstyle=PRIMARY)
+        navbar.pack(side=TOP, fill=X)
 
-        top = ttk.Frame(frm)
-        top.pack(fill="x", pady=4)
-        top.columnconfigure(1, weight=1)
-        top.columnconfigure(3, weight=1)
+        title_lbl = tb.Label(navbar, text="📅 Timetable Scheduler Pro", font=("Segoe UI", 18, "bold"), bootstyle=INVERSE)
+        title_lbl.pack(side=LEFT, padx=20, pady=10)
 
-        ttk.Label(top, text="Sections (comma):").grid(row=0, column=0, sticky="w", padx=2, pady=2)
+        self.theme_btn = tb.Checkbutton(navbar, text="Dark Mode", bootstyle="round-toggle", command=self.toggle_theme)
+        self.theme_btn.pack(side=RIGHT, padx=20)
+
+        # Main Container
+        main_container = tb.Frame(self.root)
+        main_container.pack(fill=BOTH, expand=True)
+
+        # Left Sidebar for Controls
+        self.sidebar = tb.Frame(main_container, bootstyle=SECONDARY, width=400)
+        self.sidebar.pack(side=LEFT, fill=Y, padx=0, pady=0)
+        self.sidebar.pack_propagate(False)
+
+        # Use a scrolled frame for sidebar if it gets long
+        self.sidebar_scroll = ScrolledFrame(self.sidebar, bootstyle=SECONDARY, autohide=True)
+        self.sidebar_scroll.pack(fill=BOTH, expand=True)
+
+        self.build_sidebar_content()
+
+        # Right Display Area
+        self.display_area = tb.Frame(main_container)
+        self.display_area.pack(side=RIGHT, fill=BOTH, expand=True, padx=10, pady=10)
+
+        self.build_display_placeholder()
+
+    def build_sidebar_content(self):
+        # Configuration Card
+        cfg_card = tb.LabelFrame(self.sidebar_scroll, text="General Configuration", padding=15)
+        cfg_card.pack(fill=X, padx=10, pady=10)
+
+        tb.Label(cfg_card, text="Sections (comma):").pack(anchor=W)
         self.sections_var = tk.StringVar(value="4A,4B,4C,4D")
-        ttk.Entry(top, textvariable=self.sections_var, width=30).grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        tb.Entry(cfg_card, textvariable=self.sections_var).pack(fill=X, pady=(0, 10))
 
-        ttk.Label(top, text="Days (comma):").grid(row=0, column=2, sticky="w", padx=10, pady=2)
+        tb.Label(cfg_card, text="Days (comma):").pack(anchor=W)
         self.days_var = tk.StringVar(value="Monday,Tuesday,Wednesday,Thursday,Friday,Saturday")
-        ttk.Entry(top, textvariable=self.days_var, width=30).grid(row=0, column=3, sticky="ew", padx=5, pady=2)
+        tb.Entry(cfg_card, textvariable=self.days_var).pack(fill=X, pady=(0, 10))
 
-        ttk.Label(top, text="Lecture duration (min):").grid(row=1, column=0, sticky="w", padx=2, pady=2)
+        # Time/Load Frame
+        row2 = tb.Frame(cfg_card)
+        row2.pack(fill=X)
+
+        f1 = tb.Frame(row2)
+        f1.pack(side=LEFT, fill=X, expand=True)
+        tb.Label(f1, text="Duration (min):").pack(anchor=W)
         self.duration_var = tk.IntVar(value=45)
-        ttk.Entry(top, textvariable=self.duration_var, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        tb.Entry(f1, textvariable=self.duration_var).pack(fill=X, padx=(0, 5))
 
-        ttk.Label(top, text="Start time (HH:MM):").grid(row=2, column=0, sticky="w", padx=2, pady=2)
-        self.start_var = tk.StringVar(value="09:00")
-        ttk.Entry(top, textvariable=self.start_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-        ttk.Label(top, text="Lunch start (HH:MM):").grid(row=1, column=2, sticky="w", padx=10, pady=2)
-        self.lunch_var = tk.StringVar(value="12:30")
-        ttk.Entry(top, textvariable=self.lunch_var, width=10).grid(row=1, column=3, sticky="w", padx=5, pady=2)
-
-        ttk.Label(top, text="Load per day (max slots):").grid(row=2, column=2, sticky="w", padx=10, pady=2)
+        f2 = tb.Frame(row2)
+        f2.pack(side=LEFT, fill=X, expand=True)
+        tb.Label(f2, text="Load per day:").pack(anchor=W)
         self.load_var = tk.IntVar(value=4)
-        ttk.Entry(top, textvariable=self.load_var, width=6).grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        tb.Entry(f2, textvariable=self.load_var).pack(fill=X, padx=(5, 0))
 
-        sep = ttk.Separator(frm, orient="horizontal")
-        sep.pack(fill="x", pady=8)
+        row3 = tb.Frame(cfg_card)
+        row3.pack(fill=X, pady=(10, 0))
 
-        # Updated Label to reflect that all teachers need sections now
-        teach_lbl = ttk.Label(frm, text="Teachers: NAME | SUBJECT | ALLOWED SECTIONS (comma, **REQUIRED for all subjects**)", font=("Arial", 10, "bold"))
-        teach_lbl.pack(anchor="w")
+        f3 = tb.Frame(row3)
+        f3.pack(side=LEFT, fill=X, expand=True)
+        tb.Label(f3, text="Start (HH:MM):").pack(anchor=W)
+        self.start_var = tk.StringVar(value="09:00")
+        tb.Entry(f3, textvariable=self.start_var).pack(fill=X, padx=(0, 5))
 
-        self.rows_frame = ttk.Frame(frm)
-        self.rows_frame.pack(fill="x", pady=4)
+        f4 = tb.Frame(row3)
+        f4.pack(side=LEFT, fill=X, expand=True)
+        tb.Label(f4, text="Lunch (HH:MM):").pack(anchor=W)
+        self.lunch_var = tk.StringVar(value="12:30")
+        tb.Entry(f4, textvariable=self.lunch_var).pack(fill=X, padx=(5, 0))
 
-        hdr = ttk.Frame(self.rows_frame)
-        hdr.grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(hdr, text="Name", width=25, font=("Arial", 9, "bold")).grid(row=0, column=0)
-        ttk.Label(hdr, text="Subject", width=20, font=("Arial", 9, "bold")).grid(row=0, column=1)
-        ttk.Label(hdr, text="Allowed Sections (e.g., 4A,4B,4C)", width=45, font=("Arial", 9, "bold")).grid(row=0, column=2)
+        # Teacher Management Card
+        teach_card = tb.LabelFrame(self.sidebar_scroll, text="Teachers Management", padding=15)
+        teach_card.pack(fill=X, padx=10, pady=10)
+
+        tb.Label(teach_card, text="Name | Subject | Sections", font=("Segoe UI", 8, "italic")).pack(anchor=W)
+        self.rows_container = tb.Frame(teach_card)
+        self.rows_container.pack(fill=X)
 
         self.teacher_vars = []
 
-        abs_frame = ttk.Frame(frm)
-        abs_frame.pack(fill="x", pady=6)
-
-        ttk.Label(abs_frame, text="Absent teacher (optional):").grid(row=0, column=0, sticky="w", padx=2)
-        self.absent_combo = ttk.Combobox(abs_frame, values=[], width=20)
-        self.absent_combo.grid(row=0, column=1, sticky="w", padx=6)
-
-        ttk.Label(abs_frame, text="Absent day (optional):").grid(row=0, column=2, sticky="w", padx=10)
-        self.absent_day = ttk.Combobox(abs_frame, values=to_upper_list(self.days_var.get()), width=20)
-        self.absent_day.grid(row=0, column=3, sticky="w", padx=6)
-
-        # Default data updated to enforce mapping for Non-TECH too
+        # Initial rows
         self.add_teacher_row("SUDHAKAR","TECH","4A,4D")
         self.add_teacher_row("RITIK","TECH","4C,4B")
         self.add_teacher_row("RAHUL","APTI","4A,4D")
         self.add_teacher_row("RAJEEV","HINDI","4D,4C")
 
-        btn_frame = ttk.Frame(frm)
-        btn_frame.pack(fill="x", pady=6)
+        tb.Button(teach_card, text="➕ Add Teacher", bootstyle=OUTLINE, command=lambda: self.add_teacher_row()).pack(fill=X, pady=10)
 
-        ttk.Button(btn_frame, text="➕ Add Teacher Row", command=lambda: self.add_teacher_row("","", "")).pack(side="left")
-        ttk.Button(btn_frame, text="🔄 Update Absent List", command=self.update_absent_list).pack(side="left", padx=8)
-        ttk.Button(btn_frame, text="🚀 Generate Timetable", command=self.on_generate, style='Accent.TButton').pack(side="left", padx=8)
-        ttk.Button(btn_frame, text="🔍 Show Replacement Suggestions", command=self.on_show_replacements).pack(side="left", padx=8)
+        # Actions Card
+        actions_card = tb.LabelFrame(self.sidebar_scroll, text="Substitution & Actions", padding=15)
+        actions_card.pack(fill=X, padx=10, pady=10)
 
-        out_lbl = ttk.Label(frm, text="Output (Class-wise Timetable):", font=("Arial", 10, "bold"))
-        out_lbl.pack(anchor="w", pady=(6,0))
+        tb.Label(actions_card, text="Absent Teacher:").pack(anchor=W)
+        self.absent_combo = tb.Combobox(actions_card, values=[])
+        self.absent_combo.pack(fill=X, pady=(0, 10))
 
-        self.canvas_frame = ttk.Frame(frm)
-        self.canvas_frame.pack(fill="both", expand=True)
+        tb.Label(actions_card, text="Absent Day:").pack(anchor=W)
+        self.absent_day = tb.Combobox(actions_card, values=[])
+        self.absent_day.pack(fill=X, pady=(0, 10))
 
-        self.canvas = tk.Canvas(self.canvas_frame, bg="white", height=300, borderwidth=0, highlightthickness=0)
-        self.vscroll = ttk.Scrollbar(self.canvas_frame, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vscroll.set)
-
-        self.vscroll.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-
-        self.inner = ttk.Frame(self.canvas)
-        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
-
-        self.inner.bind("<Configure>", self._on_frame_configure)
-        self.canvas.bind_all("<MouseWheel>", self._on_mouse_wheel)
-
-        self.update_absent_list()
-
-
-    def _on_frame_configure(self, event):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.canvas.configure(width=event.width)
-
-    def _on_mouse_wheel(self, event):
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-
+        tb.Button(actions_card, text="🔄 Update Lists", bootstyle=INFO, command=self.update_absent_list).pack(fill=X, pady=5)
+        tb.Button(actions_card, text="🚀 Generate Timetable", bootstyle=SUCCESS, command=self.on_generate).pack(fill=X, pady=5)
+        tb.Button(actions_card, text="🔍 Show Suggestions", bootstyle=SECONDARY, command=self.on_show_replacements).pack(fill=X, pady=5)
+        tb.Button(actions_card, text="🧹 Reset All", bootstyle=DANGER, command=self.reset_all).pack(fill=X, pady=5)
 
     def add_teacher_row(self, name="", subj="", allowed=""):
-        row = len(self.teacher_vars) + 1
+        row_frame = tb.Frame(self.rows_container)
+        row_frame.pack(fill=X, pady=2)
+
         name_var = tk.StringVar(value=name)
         subj_var = tk.StringVar(value=subj)
         allowed_var = tk.StringVar(value=allowed)
 
-        e1 = ttk.Entry(self.rows_frame, textvariable=name_var, width=25)
-        e2 = ttk.Entry(self.rows_frame, textvariable=subj_var, width=20)
-        e3 = ttk.Entry(self.rows_frame, textvariable=allowed_var, width=45)
+        tb.Entry(row_frame, textvariable=name_var, width=10).pack(side=LEFT, fill=X, expand=True, padx=1)
+        tb.Entry(row_frame, textvariable=subj_var, width=8).pack(side=LEFT, fill=X, expand=True, padx=1)
+        tb.Entry(row_frame, textvariable=allowed_var, width=12).pack(side=LEFT, fill=X, expand=True, padx=1)
 
-        e1.grid(row=row, column=0, padx=2, pady=2, sticky="w")
-        e2.grid(row=row, column=1, padx=2, pady=2, sticky="w")
-        e3.grid(row=row, column=2, padx=2, pady=2, sticky="w")
+        btn = tb.Button(row_frame, text="×", bootstyle=(DANGER, OUTLINE), width=2, command=lambda: self.remove_teacher_row(row_frame, (name_var, subj_var, allowed_var)))
+        btn.pack(side=LEFT, padx=2)
 
         self.teacher_vars.append((name_var, subj_var, allowed_var))
         self.update_absent_list()
 
+    def remove_teacher_row(self, frame, vars_tuple):
+        frame.destroy()
+        if vars_tuple in self.teacher_vars:
+            self.teacher_vars.remove(vars_tuple)
+        self.update_absent_list()
+
+    def reset_all(self):
+        if messagebox.askyesno("Confirm Reset", "Are you sure you want to clear all data?"):
+            for frame in self.rows_container.winfo_children():
+                frame.destroy()
+            self.teacher_vars = []
+            self.build_display_placeholder()
+            self._last_timetable = None
+
+    def toggle_theme(self):
+        if self.theme_btn.instate(['selected']):
+            self.style.theme_use("darkly")
+        else:
+            self.style.theme_use("flatly")
+
+    def build_display_placeholder(self):
+        for w in self.display_area.winfo_children():
+            w.destroy()
+
+        placeholder = tb.Label(self.display_area, text="Configure inputs and click\n'Generate Timetable' to begin", font=("Segoe UI", 16), justify=CENTER, bootstyle=SECONDARY)
+        placeholder.pack(expand=True)
 
     def update_absent_list(self):
         names = sorted(list(set([v[0].get().strip().upper() for v in self.teacher_vars if v[0].get().strip()])))
-
-        if hasattr(self, 'absent_combo'):
-            self.absent_combo["values"] = names
+        self.absent_combo["values"] = names
 
         days = to_upper_list(self.days_var.get())
-        if hasattr(self, 'absent_day'):
-            self.absent_day["values"] = days
+        self.absent_day["values"] = days
 
     def collect_inputs(self):
         try:
@@ -489,22 +494,16 @@ class App:
                 messagebox.showerror("Error", "Start and lunch times must be HH:MM format.")
                 return None
 
-            if duration <= 0 or load <= 0:
-                messagebox.showerror("Error", "Duration and Load must be positive numbers.")
-                return None
-
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid numeric input: {e}")
             return None
 
         slot_times = []
         cur = start
-
         for _ in range(4):
             end = add_time(cur, duration)
             slot_times.append(f"{cur}-{end}")
             cur = end
-
         slot_times.append("LUNCH")
 
         try:
@@ -512,7 +511,6 @@ class App:
             next_start = (lunch_dt + timedelta(minutes=55)).strftime("%H:%M")
             cur = next_start
         except ValueError:
-            messagebox.showerror("Error", "Invalid lunch time format for calculation.")
             return None
 
         for _ in range(2):
@@ -521,40 +519,20 @@ class App:
             cur = end
 
         teacher_data = {}
-        no_mapping_teachers = []
         for name_var, subj_var, allowed_var in self.teacher_vars:
             name = name_var.get().strip().upper()
             subj = subj_var.get().strip().upper()
             allowed = to_upper_list(allowed_var.get())
-
-            if not name or not subj:
-                continue
-            if name in teacher_data:
-                messagebox.showwarning("Warning", f"Duplicate teacher name '{name}' found. Using the first entry.")
-                continue
-
-            if not allowed:
-                no_mapping_teachers.append(name)
-
+            if not name or not subj: continue
             teacher_data[name] = {"subject": subj, "allowed_sections": allowed if allowed else None}
 
         if not teacher_data:
             messagebox.showerror("Error", "No teacher data provided.")
             return None
 
-        if no_mapping_teachers:
-            messagebox.showwarning("Warning", f"No sections allotted for teachers: {', '.join(no_mapping_teachers)}. They will not be assigned any class.")
-
         absent_name = self.absent_combo.get().strip().upper() if self.absent_combo.get().strip() else None
         absent_day = self.absent_day.get().strip() if self.absent_day.get().strip() else None
-
-        if absent_name and absent_day and absent_day not in days:
-             messagebox.showwarning("Warning", f"Absent day '{absent_day}' is not one of the selected schedule days. Skipping substitution.")
-             absent_info = None
-        elif absent_name and absent_day:
-            absent_info = (absent_name, absent_day)
-        else:
-            absent_info = None
+        absent_info = (absent_name, absent_day) if absent_name and absent_day in days else None
 
         return {
             "sections": sections,
@@ -567,170 +545,149 @@ class App:
 
     def on_generate(self):
         inputs = self.collect_inputs()
-        if not inputs:
-            return
+        if not inputs: return
 
-        sections = inputs["sections"]
-        teacher_data = inputs["teacher_data"]
-        load = inputs["load"]
-        days = inputs["days"]
-        slot_times = inputs["slot_times"]
-        absent_info = inputs["absent"]
+        timetable = build_timetable(inputs["sections"], inputs["teacher_data"], inputs["load"], inputs["days"], inputs["slot_times"])
+        timetable = fill_remaining_free_slots(timetable, inputs["teacher_data"], inputs["load"], inputs["slot_times"])
 
-        # Check for unassigned sections (optional warning)
-        all_allowed_sections = set()
-        for t, info in teacher_data.items():
-            if info["allowed_sections"]:
-                all_allowed_sections.update(info["allowed_sections"])
+        if inputs["absent"]:
+            absent_name, absent_day = inputs["absent"]
+            substitute_absent(timetable, absent_day, absent_name, inputs["teacher_data"], inputs["load"], inputs["slot_times"])
 
-        unassigned_sections = [s for s in sections if s not in all_allowed_sections]
-        if unassigned_sections:
-            res = messagebox.askyesno("Warning",
-                f"No teacher is allotted to sections: {', '.join(unassigned_sections)}. These sections will have FREE slots. Continue?")
-            if not res:
-                return
-
-        timetable = build_timetable(sections, teacher_data, load, days, slot_times, tech_subject="TECH")
-
-        timetable = fill_remaining_free_slots(timetable, teacher_data, load, slot_times, tech_subject="TECH")
-
-        if absent_info:
-            absent_name, absent_day = absent_info
-            if absent_name not in teacher_data:
-                messagebox.showwarning("Absent", f"Absent teacher '{absent_name}' not found in teacher list. Skipping substitution.")
-            else:
-                substitute_absent(timetable, absent_day, absent_name, teacher_data, load, slot_times)
-                messagebox.showinfo("Substitution Complete",
-                    f"Substitution attempted for **{absent_name}** on **{absent_day}**.")
-
-        self._display_timetable(timetable, sections, days, slot_times)
+        self._display_timetable(timetable, inputs["sections"], inputs["days"], inputs["slot_times"])
 
         self._last_timetable = timetable
-        self._last_teacher_data = teacher_data
-        self._last_load = load
-        self._last_slot_times = slot_times
-
+        self._last_teacher_data = inputs["teacher_data"]
+        self._last_load = inputs["load"]
+        self._last_slot_times = inputs["slot_times"]
 
     def _display_timetable(self, timetable, sections, days, slot_times):
-        for w in self.inner.winfo_children():
+        for w in self.display_area.winfo_children():
             w.destroy()
 
-        r = 0
+        # Container with Scrollbar
+        scroll_container = ScrolledFrame(self.display_area, autohide=True)
+        scroll_container.pack(fill=BOTH, expand=True)
 
-        legend_frame = ttk.Frame(self.inner)
-        legend_frame.grid(row=r, column=0, sticky="w", pady=4, padx=5)
-        ttk.Label(legend_frame, text="Legend: ", font=("Arial", 10, "bold")).pack(side="left")
+        inner = tb.Frame(scroll_container)
+        inner.pack(fill=BOTH, expand=True, padx=10, pady=10)
 
-        tk.Label(legend_frame, text="Lecture (Subj/Teacher)", font=("Arial",10), bg="#fff3bf", padx=5).pack(side="left", padx=5)
-        tk.Label(legend_frame, text="LUNCH", font=("Arial",10), bg="#ffb86b", padx=5).pack(side="left", padx=5)
-        tk.Label(legend_frame, text="FREE Slot", font=("Arial",10), bg="#e9ecef", padx=5).pack(side="left", padx=5)
-        r += 1
+        # Legend Bar
+        legend = tb.Frame(inner)
+        legend.pack(fill=X, pady=(0, 20))
+
+        marks = [
+            ("LECTURE", "#3498db", "inverse-primary"),
+            ("LUNCH", "#95a5a6", "inverse-secondary"),
+            ("FREE", "#ecf0f1", "inverse-light"),
+            ("SUBSTITUTE", "#2ecc71", "inverse-success")
+        ]
+
+        for text, color, bstyle in marks:
+            lbl = tb.Label(legend, text=text, bootstyle=bstyle, padding=(10, 5), font=("Segoe UI", 9, "bold"))
+            lbl.pack(side=LEFT, padx=5)
 
         for sec in sections:
-            colspan = len(slot_times) + 1
-            sec_lbl = tk.Label(self.inner, text=f"SECTION: {sec}", font=("Arial", 14, "bold"), bg="#d1f7c4", anchor="w")
-            sec_lbl.grid(row=r, column=0, sticky="ew", pady=(10,4), padx=2, columnspan=colspan)
-            r += 1
+            sec_card = tb.LabelFrame(inner, text=f"SECTION: {sec}", padding=10)
+            sec_card.pack(fill=X, pady=10)
 
-            hdr_frame = ttk.Frame(self.inner)
-            hdr_frame.grid(row=r, column=0, sticky="ew", columnspan=colspan)
+            # Use a Treeview for the grid
+            cols = ["Day"] + slot_times
+            tree = tb.Treeview(sec_card, columns=cols, show="headings", height=len(days), bootstyle=PRIMARY)
+            tree.pack(fill=X)
 
-            ttk.Label(hdr_frame, text="DAY ➡️", width=15, font=("Arial", 10, "bold"), anchor="w", background="#e6f2ff").grid(row=0, column=0, padx=2, sticky="ew")
-            for col, slot in enumerate(slot_times):
-                ttk.Label(hdr_frame, text=slot, width=15, font=("Arial", 10, "bold"), anchor="center", background="#e6f2ff").grid(row=0, column=col+1, padx=1, sticky="ew")
-            r += 1
+            tree.heading("Day", text="Day")
+            tree.column("Day", width=120, anchor=W)
+            for slot in slot_times:
+                tree.heading(slot, text=slot)
+                tree.column(slot, width=150, anchor=CENTER)
 
-            for day_idx, day in enumerate(days):
-                row_frame = ttk.Frame(self.inner)
-                row_frame.grid(row=r + day_idx, column=0, sticky="ew", columnspan=colspan)
+            for day in days:
+                row_vals = [day]
+                for i, slot in enumerate(slot_times):
+                    val = timetable[day][sec][i]
+                    if val == "LUNCH": text = "🍱 LUNCH"
+                    elif val == "FREE": text = "💨 FREE"
+                    else: text = val
+                    row_vals.append(text)
 
-                tk.Label(row_frame, text=day, font=("Arial", 10, "bold"), width=15, anchor="w", background="#e6f2ff", relief="raised").grid(row=0, column=0, padx=2, pady=1, sticky="ew")
+                # Tags for coloring
+                item = tree.insert("", "end", values=row_vals)
 
-                for col, slot in enumerate(slot_times):
-                    val = timetable[day][sec][col]
+            # Note: Ttk Treeview doesn't easily support per-cell background color
+            # without complex tags. We'll rely on text indicators for now or use Labels if preferred.
+            # Let's use a Grid of Labels for better color coding as requested.
+            tree.destroy()
 
+            grid_frame = tb.Frame(sec_card)
+            grid_frame.pack(fill=X)
+
+            # Header
+            tb.Label(grid_frame, text="DAY", width=15, font=("Segoe UI", 10, "bold"), bootstyle=SECONDARY).grid(row=0, column=0, padx=1, pady=1, sticky=NSEW)
+            for c, slot in enumerate(slot_times):
+                tb.Label(grid_frame, text=slot, width=20, font=("Segoe UI", 10, "bold"), anchor=CENTER, bootstyle=SECONDARY).grid(row=0, column=c+1, padx=1, pady=1, sticky=NSEW)
+
+            for r, day in enumerate(days):
+                tb.Label(grid_frame, text=day, font=("Segoe UI", 9, "bold"), bootstyle=LIGHT).grid(row=r+1, column=0, padx=1, pady=1, sticky=NSEW)
+                for c, slot in enumerate(slot_times):
+                    val = timetable[day][sec][c]
+
+                    bstyle = LIGHT
+                    text = val
                     if val == "LUNCH":
-                        bg = "#ffb86b"
+                        bstyle = WARNING
                         text = "LUNCH BREAK"
                     elif val == "FREE":
-                        bg = "#e9ecef"
-                        text = "FREE"
+                        bstyle = SECONDARY
+                    elif "[SUB]" in val:
+                        bstyle = SUCCESS
                     else:
-                        bg = "#fff3bf"
-                        text = val
+                        bstyle = PRIMARY
 
-                    tk.Label(row_frame, text=text, bg=bg, width=15, anchor="center", borderwidth=1, relief="solid").grid(row=0, column=col+1, padx=1, pady=1, sticky="ew")
+                    lbl = tb.Label(grid_frame, text=text, anchor=CENTER, padding=10, bootstyle=bstyle, font=("Segoe UI", 9))
+                    lbl.grid(row=r+1, column=c+1, padx=1, pady=1, sticky=NSEW)
 
-                row_frame.columnconfigure(0, weight=0)
-                for c in range(1, colspan):
-                    row_frame.columnconfigure(c, weight=1)
-
-            r += len(days)
-
-            sep = ttk.Separator(self.inner, orient="horizontal")
-            sep.grid(row=r, column=0, sticky="ew", pady=8, columnspan=colspan)
-            r += 1
-
-        self.inner.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
+            for i in range(len(slot_times) + 1):
+                grid_frame.columnconfigure(i, weight=1)
 
     def on_show_replacements(self):
         if self._last_timetable is None:
-            messagebox.showerror("Error", "Generate timetable first.")
+            messagebox.showerror("Error", "Please generate a timetable first.")
             return
 
         rows = build_replacement_suggestions(self._last_timetable, self._last_teacher_data, self._last_load, self._last_slot_times)
 
-        win = tk.Toplevel(self.root)
+        win = tb.Toplevel(self.root)
         win.title("Replacement Suggestions")
-        win.geometry("900x500")
+        win.geometry("1000x600")
 
-        cols = ("Day", "Slot", "Section", "Subject", "Assigned", "Candidates")
-        tree_frame = ttk.Frame(win, padding=5)
-        tree_frame.pack(fill="both", expand=True)
+        container = tb.Frame(win, padding=20)
+        container.pack(fill=BOTH, expand=True)
 
-        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=20)
+        tb.Label(container, text="Available Substitutes", font=("Segoe UI", 16, "bold")).pack(anchor=W, pady=(0, 10))
+        tb.Label(container, text="Filtered: Only showing slots with available candidates.", font=("Segoe UI", 10, "italic"), bootstyle=INFO).pack(anchor=W, pady=(0, 10))
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        tree.pack(side="left", fill="both", expand=True)
+        cols = ("Day", "Slot", "Section", "Subject", "Current", "Candidates")
+        tree = tb.Treeview(container, columns=cols, show="headings", bootstyle=INFO)
+        tree.pack(fill=BOTH, expand=True)
 
         tree.heading("Day", text="Day")
-        tree.column("Day", width=100, anchor="w")
         tree.heading("Slot", text="Slot Time")
-        tree.column("Slot", width=120, anchor="center")
         tree.heading("Section", text="Section")
-        tree.column("Section", width=80, anchor="center")
         tree.heading("Subject", text="Subject")
-        tree.column("Subject", width=80, anchor="center")
-        tree.heading("Assigned", text="Assigned Teacher")
-        tree.column("Assigned", width=120, anchor="w")
-        tree.heading("Candidates", text="Available Candidates (Teachers)")
-        tree.column("Candidates", width=350, anchor="w")
+        tree.heading("Current", text="Assigned Teacher")
+        tree.heading("Candidates", text="Available Candidates")
+
+        for col in cols:
+            tree.column(col, anchor=CENTER)
+        tree.column("Candidates", width=350, anchor=W)
 
         for r in rows:
-            cand_str = ", ".join(r["candidates"]) if r["candidates"] else "No available substitute"
+            cand_str = ", ".join(r["candidates"])
             tree.insert("", "end", values=(r["day"], r["slot_label"], r["section"], r["subject"], r["assigned_teacher"], cand_str))
-
-        ttk.Label(win, text="* Candidates are teachers who teach the same subject, have capacity, are not teaching another section at that time, and generally satisfy the time gap rule.", font=("Arial", 9)).pack(pady=5)
-
 
 # run
 if __name__ == "__main__":
-    root = tk.Tk()
-
-    style = ttk.Style(root)
-    style.theme_use('clam')
-    style.configure('Accent.TButton', background='#4CAF50', foreground='black', font=('Arial', 10, 'bold'))
-    style.map('Accent.TButton',
-        background=[('active', '#66BB6A'), ('!disabled', '#4CAF50')],
-        foreground=[('active', 'white'), ('!disabled', 'black')]
-    )
-
+    root = tb.Window(themename="flatly")
     app = App(root)
     root.mainloop()
