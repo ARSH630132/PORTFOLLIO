@@ -12,14 +12,12 @@ FILE_PATHS = ["leads_1.csv", "leads_2.xlsx"]  # To be populated with actual file
 # These are the columns used for internal filtering logic
 ALIASES = {
     "email": ["email", "email address", "e-mail", "email_1", "contact email", "primary email"],
-    "mobile": ["mobile", "phone", "cell", "contact number", "mobile number", "phone number", "primary phone"],
-    "dob": ["dob", "date of birth", "birth date", "birthdate", "age", "birthday", "date_of_birth"]
+    "mobile": ["mobile", "phone", "cell", "contact number", "mobile number", "phone number", "primary phone"]
 }
 
 # Internal consistent column names
 L_EMAIL = "email"
 L_MOBILE = "mobile"
-L_DOB = "dob"
 
 def load_data(file_paths):
     lazy_frames = []
@@ -47,7 +45,7 @@ def load_data(file_paths):
 
             normalized_cols = list(normalized_map.values())
 
-            # 2. Map aliases to our internal processing names (email, mobile, dob)
+            # 2. Map aliases to our internal processing names (email, mobile)
             final_map = {}
             for internal, alias_list in ALIASES.items():
                 found_col = next((c for c in alias_list if c in normalized_cols), None)
@@ -66,11 +64,6 @@ def load_data(file_paths):
             # Apply the mapping (renames target columns to internal names)
             lf = lf.rename(final_map)
 
-            # 4. Handle missing DOB column
-            if L_DOB not in lf.collect_schema().names():
-                print(f"Warning: DOB column missing in {path}. Adding empty DOB column.")
-                lf = lf.with_columns(pl.lit(None).alias(L_DOB))
-
             lazy_frames.append(lf)
             print(f"Successfully loaded {path} with {len(normalized_cols)} columns.")
         except Exception as e:
@@ -81,24 +74,6 @@ def load_data(file_paths):
 
     # Use diagonal concatenation to handle different columns in different files
     return pl.concat(lazy_frames, how="diagonal")
-
-def filter_age(lf):
-    current_year = datetime.now().year
-
-    # Handle DOB formats like 'MM/DD/YYYY', 'YYYY-MM-DD', or just 'YYYY'
-    # We extract the first sequence of 4 digits which represents the year in these formats
-    lf = lf.with_columns(
-        pl.col(L_DOB).cast(pl.String).str.extract(r"(\d{4})").cast(pl.Int32).alias("birth_year")
-    )
-
-    # Filter: Keep if age <= 40.
-    # NOTE: We keep rows where birth_year is null to avoid dropping 100% of data
-    # if the column was missing or unparseable.
-    lf = lf.filter(
-        pl.col("birth_year").is_null() | ((current_year - pl.col("birth_year")) <= 40)
-    ).drop("birth_year")
-
-    return lf
 
 def filter_emails(lf):
     # Strict email regex
@@ -111,9 +86,9 @@ def filter_emails(lf):
     return lf
 
 def clean_mobile(lf):
-    # Strip symbols (+, -, spaces)
+    # Strip symbols (+, -, spaces, parentheses)
     lf = lf.with_columns(
-        pl.col(L_MOBILE).cast(pl.String).str.replace_all(r"[\+\-\s]", "")
+        pl.col(L_MOBILE).cast(pl.String).str.replace_all(r"[\+\-\s\(\)]", "")
     )
 
     # Strip country code '91' or '1' if it starts with it and has 12/11 digits
@@ -228,9 +203,6 @@ def main():
     if lf is None:
         print("No data loaded.")
         return
-
-    print("Filtering by age...")
-    lf = filter_age(lf)
 
     print("Validating emails...")
     lf = filter_emails(lf)
