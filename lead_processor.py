@@ -24,29 +24,57 @@ def load_data(file_paths):
             continue
 
         try:
+            print(f"Attempting to load {path}...")
             if path.endswith('.csv'):
-                lf = pl.scan_csv(path)
+                # For massive CSVs, scan_csv is lazy and memory efficient
+                lf = pl.scan_csv(path, infer_schema_length=10000)
             elif path.endswith(('.xlsx', '.xls')):
-                # read_excel doesn't support lazy scanning directly in the same way,
-                # so we read and then convert to lazy
+                # Note: Excel reading is not natively lazy in Polars.
+                # It will load the sheet into memory.
                 df = pl.read_excel(path, engine='calamine')
                 lf = df.lazy()
             else:
                 print(f"Unsupported file format: {path}")
                 continue
 
-            # Map columns to lowercase
+            # --- ROBUST COLUMN MATCHING ---
+            # 1. Get the current column names safely
+            current_cols = lf.collect_schema().names()
+
+            # 2. Strip and lowercase all existing column names to normalize them
+            lf = lf.rename({c: c.strip().lower() for c in current_cols})
+
+            # 3. Check for our target columns (Email, Mobile, DOB) in the normalized list
+            # We use the lowercase version of the user-provided constants
+            target_email = COL_EMAIL.lower()
+            target_mobile = COL_MOBILE.lower()
+            target_dob = COL_DOB.lower()
+
+            # Verify they all exist in the file
+            existing_cols_normalized = lf.collect_schema().names()
+            missing = []
+            if target_email not in existing_cols_normalized: missing.append(COL_EMAIL)
+            if target_mobile not in existing_cols_normalized: missing.append(COL_MOBILE)
+            if target_dob not in existing_cols_normalized: missing.append(COL_DOB)
+
+            if missing:
+                print(f"Error in {path}: Missing columns {missing}")
+                print(f"Found columns (normalized): {existing_cols_normalized}")
+                continue
+
+            # 3. Map the normalized names to our final internal names (L_EMAIL, etc.)
+            # These are already lowercase so they might match, but rename handles it safely.
             lf = lf.rename({
-                COL_EMAIL: L_EMAIL,
-                COL_MOBILE: L_MOBILE,
-                COL_DOB: L_DOB
+                target_email: L_EMAIL,
+                target_mobile: L_MOBILE,
+                target_dob: L_DOB
             })
 
-            # Select only needed columns to keep it clean
+            # 4. Select and keep ONLY our 3 columns
             lf = lf.select([L_EMAIL, L_MOBILE, L_DOB])
 
             lazy_frames.append(lf)
-            print(f"Loaded {path}")
+            print(f"Successfully loaded and normalized {path}")
         except Exception as e:
             print(f"Error loading {path}: {e}")
 
