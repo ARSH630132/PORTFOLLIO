@@ -58,8 +58,8 @@ def load_data(file_paths):
 def filter_age(lf):
     current_year = datetime.now().year
 
-    # Handle DOB being 'YYYY-MM-DD' or just 'YYYY'
-    # We cast to string first, then extract the first 4 digits as year
+    # Handle DOB formats like 'MM/DD/YYYY', 'YYYY-MM-DD', or just 'YYYY'
+    # We extract the first sequence of 4 digits which represents the year in these formats
     lf = lf.with_columns(
         pl.col(L_DOB).cast(pl.String).str.extract(r"(\d{4})").cast(pl.Int32).alias("birth_year")
     )
