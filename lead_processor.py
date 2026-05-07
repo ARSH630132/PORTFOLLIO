@@ -9,10 +9,11 @@ from datetime import datetime
 FILE_PATHS = ["leads_1.csv", "leads_2.xlsx"]  # To be populated with actual file paths
 
 # Define Aliases for robust mapping
+# These are the columns used for internal filtering logic
 ALIASES = {
-    "email": ["email", "email address", "e-mail", "email_1", "contact email"],
-    "mobile": ["mobile", "phone", "cell", "contact number", "mobile number", "phone number"],
-    "dob": ["dob", "date of birth", "birth date", "birthdate", "age", "birthday"]
+    "email": ["email", "email address", "e-mail", "email_1", "contact email", "primary email"],
+    "mobile": ["mobile", "phone", "cell", "contact number", "mobile number", "phone number", "primary phone"],
+    "dob": ["dob", "date of birth", "birth date", "birthdate", "age", "birthday", "date_of_birth"]
 }
 
 # Internal consistent column names
@@ -38,52 +39,48 @@ def load_data(file_paths):
                 print(f"Unsupported file format: {path}")
                 continue
 
-            # Normalize column names: strip spaces and lowercase
+            # 1. Normalize ALL existing column names (strip spaces, lowercase)
+            # This ensures we can match them easily while keeping ALL data
             current_cols = lf.collect_schema().names()
             normalized_map = {c: c.strip().lower() for c in current_cols}
             lf = lf.rename(normalized_map)
 
             normalized_cols = list(normalized_map.values())
 
-            # Map aliases to internal names
+            # 2. Map aliases to our internal processing names (email, mobile, dob)
             final_map = {}
             for internal, alias_list in ALIASES.items():
-                # Find which alias exists in the normalized columns
                 found_col = next((c for c in alias_list if c in normalized_cols), None)
                 if found_col:
+                    # If the column already has the internal name, rename is a no-op
                     final_map[found_col] = internal
                 else:
                     print(f"Warning: Could not find a match for '{internal}' in {path}")
 
-            # Check if mandatory columns (email, mobile) are present
-            # Based on user's sample: 'email' and 'phone' are present.
+            # 3. Validate mandatory columns (email, mobile)
             if L_EMAIL not in final_map.values() or L_MOBILE not in final_map.values():
                 print(f"Skipping {path}: Missing mandatory columns (Email/Mobile).")
-                print(f"Available columns: {normalized_cols}")
-                # Print first few rows to help user debug
-                print("Sample data from file:")
-                print(lf.head(5).collect())
+                print(f"Found headers: {normalized_cols}")
                 continue
 
+            # Apply the mapping (renames target columns to internal names)
             lf = lf.rename(final_map)
 
-            # If DOB is missing, add a null column so the rest of the script doesn't crash
+            # 4. Handle missing DOB column
             if L_DOB not in lf.collect_schema().names():
                 print(f"Warning: DOB column missing in {path}. Adding empty DOB column.")
                 lf = lf.with_columns(pl.lit(None).alias(L_DOB))
 
-            # Select and keep ONLY our columns
-            lf = lf.select([L_EMAIL, L_MOBILE, L_DOB])
-
             lazy_frames.append(lf)
-            print(f"Successfully loaded and mapped {path}")
+            print(f"Successfully loaded {path} with {len(normalized_cols)} columns.")
         except Exception as e:
             print(f"Error loading {path}: {e}")
 
     if not lazy_frames:
         return None
 
-    return pl.concat(lazy_frames)
+    # Use diagonal concatenation to handle different columns in different files
+    return pl.concat(lazy_frames, how="diagonal")
 
 def filter_age(lf):
     current_year = datetime.now().year
@@ -148,7 +145,8 @@ def validate_mx(lf):
     # However, we can use a join with a small dataframe of valid domains.
 
     print("Extracting unique domains for MX validation...")
-    unique_domains = lf.select("domain").unique().collect().get_column("domain").to_list()
+    unique_domains_df = lf.select("domain").unique().collect()
+    unique_domains = unique_domains_df.get_column("domain").to_list()
 
     valid_domains = []
     print(f"Checking {len(unique_domains)} unique domains...")
@@ -173,7 +171,7 @@ def validate_mx(lf):
     print(f"Found {len(valid_domains)} valid domains.")
 
     # Filter main dataset
-    valid_domains_df = pl.DataFrame({"domain": valid_domains}).lazy()
+    valid_domains_df = pl.DataFrame({"domain": valid_domains}, schema={"domain": pl.String}).lazy()
     lf = lf.join(valid_domains_df, on="domain", how="inner").drop("domain")
 
     return lf
