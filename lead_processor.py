@@ -7,14 +7,18 @@ from datetime import datetime
 
 # 1. Configuration & Column Mapping
 FILE_PATHS = ["leads_1.csv", "leads_2.xlsx"]  # To be populated with actual file paths
-COL_EMAIL = "Email"
-COL_MOBILE = "Mobile"
-COL_DOB = "DOB"
 
-# Internal lowercase names
-L_EMAIL = COL_EMAIL.lower()
-L_MOBILE = COL_MOBILE.lower()
-L_DOB = COL_DOB.lower()
+# Define Aliases for robust mapping
+ALIASES = {
+    "email": ["email", "email address", "e-mail", "email_1", "contact email"],
+    "mobile": ["mobile", "phone", "cell", "contact number", "mobile number", "phone number"],
+    "dob": ["dob", "date of birth", "birth date", "birthdate", "age", "birthday"]
+}
+
+# Internal consistent column names
+L_EMAIL = "email"
+L_MOBILE = "mobile"
+L_DOB = "dob"
 
 def load_data(file_paths):
     lazy_frames = []
@@ -26,55 +30,53 @@ def load_data(file_paths):
         try:
             print(f"Attempting to load {path}...")
             if path.endswith('.csv'):
-                # For massive CSVs, scan_csv is lazy and memory efficient
                 lf = pl.scan_csv(path, infer_schema_length=10000)
             elif path.endswith(('.xlsx', '.xls')):
-                # Note: Excel reading is not natively lazy in Polars.
-                # It will load the sheet into memory.
                 df = pl.read_excel(path, engine='calamine')
                 lf = df.lazy()
             else:
                 print(f"Unsupported file format: {path}")
                 continue
 
-            # --- ROBUST COLUMN MATCHING ---
-            # 1. Get the current column names safely
+            # Normalize column names: strip spaces and lowercase
             current_cols = lf.collect_schema().names()
+            normalized_map = {c: c.strip().lower() for c in current_cols}
+            lf = lf.rename(normalized_map)
 
-            # 2. Strip and lowercase all existing column names to normalize them
-            lf = lf.rename({c: c.strip().lower() for c in current_cols})
+            normalized_cols = list(normalized_map.values())
 
-            # 3. Check for our target columns (Email, Mobile, DOB) in the normalized list
-            # We use the lowercase version of the user-provided constants
-            target_email = COL_EMAIL.lower()
-            target_mobile = COL_MOBILE.lower()
-            target_dob = COL_DOB.lower()
+            # Map aliases to internal names
+            final_map = {}
+            for internal, alias_list in ALIASES.items():
+                # Find which alias exists in the normalized columns
+                found_col = next((c for c in alias_list if c in normalized_cols), None)
+                if found_col:
+                    final_map[found_col] = internal
+                else:
+                    print(f"Warning: Could not find a match for '{internal}' in {path}")
 
-            # Verify they all exist in the file
-            existing_cols_normalized = lf.collect_schema().names()
-            missing = []
-            if target_email not in existing_cols_normalized: missing.append(COL_EMAIL)
-            if target_mobile not in existing_cols_normalized: missing.append(COL_MOBILE)
-            if target_dob not in existing_cols_normalized: missing.append(COL_DOB)
-
-            if missing:
-                print(f"Error in {path}: Missing columns {missing}")
-                print(f"Found columns (normalized): {existing_cols_normalized}")
+            # Check if mandatory columns (email, mobile) are present
+            # Based on user's sample: 'email' and 'phone' are present.
+            if L_EMAIL not in final_map.values() or L_MOBILE not in final_map.values():
+                print(f"Skipping {path}: Missing mandatory columns (Email/Mobile).")
+                print(f"Available columns: {normalized_cols}")
+                # Print first few rows to help user debug
+                print("Sample data from file:")
+                print(lf.head(5).collect())
                 continue
 
-            # 3. Map the normalized names to our final internal names (L_EMAIL, etc.)
-            # These are already lowercase so they might match, but rename handles it safely.
-            lf = lf.rename({
-                target_email: L_EMAIL,
-                target_mobile: L_MOBILE,
-                target_dob: L_DOB
-            })
+            lf = lf.rename(final_map)
 
-            # 4. Select and keep ONLY our 3 columns
+            # If DOB is missing, add a null column so the rest of the script doesn't crash
+            if L_DOB not in lf.collect_schema().names():
+                print(f"Warning: DOB column missing in {path}. Adding empty DOB column.")
+                lf = lf.with_columns(pl.lit(None).alias(L_DOB))
+
+            # Select and keep ONLY our columns
             lf = lf.select([L_EMAIL, L_MOBILE, L_DOB])
 
             lazy_frames.append(lf)
-            print(f"Successfully loaded and normalized {path}")
+            print(f"Successfully loaded and mapped {path}")
         except Exception as e:
             print(f"Error loading {path}: {e}")
 
@@ -92,8 +94,11 @@ def filter_age(lf):
         pl.col(L_DOB).cast(pl.String).str.extract(r"(\d{4})").cast(pl.Int32).alias("birth_year")
     )
 
+    # Filter: Keep if age <= 40.
+    # NOTE: We keep rows where birth_year is null to avoid dropping 100% of data
+    # if the column was missing or unparseable.
     lf = lf.filter(
-        (current_year - pl.col("birth_year")) <= 40
+        pl.col("birth_year").is_null() | ((current_year - pl.col("birth_year")) <= 40)
     ).drop("birth_year")
 
     return lf
