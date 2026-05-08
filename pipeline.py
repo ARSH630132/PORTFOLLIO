@@ -1,5 +1,6 @@
 import polars as pl
 import os
+import sys
 import json
 import logging
 import re
@@ -12,6 +13,13 @@ import argparse
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
+# --- Standard Library Protection ---
+# CRITICAL: Ensure no file named 'csv.py' exists in the working directory to avoid import conflicts.
+if (Path.cwd() / "csv.py").exists():
+    print("FATAL ERROR: A file named 'csv.py' was found in your directory.")
+    print("This conflicts with the Python standard library. Please rename it to something else (e.g., 'csv_utils.py').")
+    sys.exit(1)
+
 # --- Global Configuration & Constants ---
 DISPOSABLE_DOMAINS = {
     "mailinator.com", "tempmail.com", "guerrillamail.com", "yopmail.com",
@@ -19,14 +27,14 @@ DISPOSABLE_DOMAINS = {
     "disposable.com", "guerrillamail.biz", "guerrillamail.org"
 }
 
-# Standardized column aliases for heterogeneous CSV headers
+# Standardized column aliases for heterogeneous CSV/Excel headers
 ALIASES = {
     "email": ["email", "e-mail", "mail_id", "email_address", "user_email", "email_id"],
     "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp", "mobile_no.", "alternate_number"],
     "dob": ["dob", "date_of_birth", "birth_date", "birthday"],
     "age": ["age", "years", "current_age"],
     "gender": ["gender", "sex", "m/f", "gen"],
-    "salary": ["salary", "salery", "current_salary", "ctc", "expected_salary", "salery"]
+    "salary": ["salary", "salery", "current_salary", "ctc", "expected_salary"]
 }
 
 # Global MX Cache
@@ -57,7 +65,7 @@ class DomainValidator:
             return clean_domain, False
 
     def validate_domains(self, domains: List[str]) -> List[str]:
-        """Parallelized MX lookup to drastically speed up processing."""
+        """Parallelized MX lookup for speed optimization."""
         to_check = [d for d in domains if d and d not in mx_cache]
         if not to_check:
             return [d for d in domains if d and mx_cache.get(d) is True]
@@ -75,35 +83,42 @@ class DomainValidator:
 # --- Standalone Worker Functions ---
 
 def get_cleaning_expressions():
-    """Identifier normalization logic shared across processes."""
+    """Identifier normalization logic."""
     return [
         pl.col("email").str.replace_all(r"[^\x20-\x7E]", "").str.strip_chars().str.to_lowercase().alias("email"),
         pl.col("mobile").str.replace_all(r"[^\x20-\x7E]", "").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
     ]
 
 def process_single_file_task(file_path: str, output_dir: str):
-    """
-    Independent worker task for Multiprocessing.
-    Handles: Scanning, header normalization, type casting, and intermediate persistence.
-    """
+    """Worker task: Scans, standardizes and saves intermediate IPC."""
     try:
         temp_dir = Path(output_dir) / "temp_processed"
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        file_name = Path(file_path).name
+        path_obj = Path(file_path)
+        file_name = path_obj.name
         target_path = temp_dir / f"{file_name}.ipc"
 
-        # 1. Scan with high tolerance for encoding/structure issues
-        lf = pl.scan_csv(
-            file_path,
-            encoding="utf8-lossy",
-            ignore_errors=True,
-            infer_schema_length=2000,
-            truncate_ragged_lines=True,
-            null_values=["", "NA", "N/A", "null", "NULL"]
-        )
+        # Support both .csv and .xlsx
+        ext = path_obj.suffix.lower()
+        if ext == '.csv':
+            lf = pl.scan_csv(
+                file_path,
+                encoding="utf8-lossy",
+                ignore_errors=True,
+                infer_schema_length=2000,
+                truncate_ragged_lines=True,
+                null_values=["", "NA", "N/A", "null", "NULL"]
+            )
+        elif ext in ['.xlsx', '.xls']:
+            # Excel files are read into memory first, then converted to LazyFrame
+            # Note: requires 'fastexcel' or 'calamine' engine
+            df_excel = pl.read_excel(file_path)
+            lf = df_excel.lazy()
+        else:
+            return f"ERROR: Unsupported extension {ext} for {file_path}"
 
-        # 2. Schema Alignment & Header Normalization
+        # Schema Alignment & Header Normalization
         orig_cols = lf.collect_schema().names()
         lf = lf.rename({c: c.lower() for c in orig_cols})
         cols = [c.lower() for c in orig_cols]
@@ -128,7 +143,7 @@ def process_single_file_task(file_path: str, output_dir: str):
 
         lf = lf.with_columns(get_cleaning_expressions())
 
-        # Mandatory filter
+        # Mandatory filter: Email and Mobile must not be empty
         lf = lf.filter(
             pl.col("email").is_not_null() & (pl.col("email") != "") &
             pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
@@ -159,6 +174,7 @@ def get_dob_age_expressions():
         pl.col("dob").str.to_date("%d/%m/%y", strict=False),
     ])
 
+    # Pivot logic: 90 -> 1990
     fixed_dob = (
         pl.when(parsed_dob.dt.year() < 100)
         .then(
@@ -224,8 +240,13 @@ class LeadsETL:
             json.dump(list(self.processed_files), f)
 
     def run(self):
-        files = sorted([str(f) for f in self.input_dir.glob("*.csv")])
-        to_process = [f for f in files if f not in self.processed_files]
+        # Flexible file loading for .csv and .xlsx
+        all_files = []
+        for ext in ['*.csv', '*.CSV', '*.xlsx', '*.XLSX', '*.xls', '*.XLS']:
+            all_files.extend([str(f) for f in self.input_dir.glob(ext)])
+
+        all_files = sorted(list(set(all_files)))
+        to_process = [f for f in all_files if f not in self.processed_files]
 
         if not to_process:
             logging.info("No new files found for processing.")
@@ -253,7 +274,7 @@ class LeadsETL:
 
         # Phase 2: Global Logic & Deduplication
         logging.info("Merging intermediate results and applying global logic...")
-        # FIX: heterogeneous schema merge error. Use diagonal concat for IPC files.
+        # FIX: diagonal concat for heterogeneous IPC schemas
         full_lf = pl.concat([pl.scan_ipc(f) for f in ipc_files], how="diagonal")
 
         # Deduplication
@@ -262,7 +283,6 @@ class LeadsETL:
         full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
-        # Parallelized Deliverability Check
         logging.info("Extracting unique domains for parallel validation...")
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
@@ -337,35 +357,34 @@ class LeadsETL:
         return df
 
     def persist(self, lf: pl.LazyFrame, name: str):
-        """Multi-format persistence with schema safety."""
+        """Focus on CSV and SQLite. Removed Excel export logic for high-volume safety."""
         db_path = self.output_dir / "leads_production.db"
         csv_path = self.output_dir / f"{name}.csv"
-        xlsx_path = self.output_dir / f"{name}.xlsx"
 
         try:
             df = self._sync_schema_and_collect(lf, name, db_path)
             if df.is_empty(): return
 
+            # CSV Export
             df.write_csv(csv_path)
+            logging.info(f"Successfully exported {name}.csv ({len(df)} records).")
 
+            # SQLite Export (ADBC)
             df.write_database(
                 table_name=name,
                 connection=f"sqlite:///{db_path}",
                 if_table_exists="append",
                 engine="adbc"
             )
+            logging.info(f"Successfully appended {name} to SQLite.")
 
-            if len(df) <= 1048575:
-                df.write_excel(xlsx_path)
-
-            logging.info(f"Successfully exported {name}: {len(df)} records.")
         except Exception as e:
             logging.error(f"Persistence error for {name}: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
+    parser = argparse.ArgumentParser(description="Production-grade Leads ETL Pipeline")
+    parser.add_argument("--input", required=True, help="Input directory path")
+    parser.add_argument("--output", required=True, help="Output directory path")
     args = parser.parse_args()
 
     LeadsETL(args.input, args.output).run()
