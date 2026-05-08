@@ -17,13 +17,13 @@ DISPOSABLE_DOMAINS = {
 }
 
 ALIASES = {
-    "email": ["email", "e-mail", "mail_id", "email_address", "user_email"],
-    "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp"],
+    "email": ["email", "e-mail", "mail_id", "email_address", "user_email", "email_id"],
+    "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp", "mobile_no.", "alternate_number"],
     "dob": ["dob", "date_of_birth", "birth_date", "birthday"],
     "age": ["age", "years", "current_age"]
 }
 
-# Rule 8: Global MX Cache
+# Global MX Cache (Rule 8)
 mx_cache: Dict[str, bool] = {}
 
 class DomainValidator:
@@ -33,7 +33,7 @@ class DomainValidator:
         self.resolver.timeout = 2.0
 
     def check_deliverability(self, domain: str) -> bool:
-        """Check MX records and block disposables (Rule 7, 8, 14)."""
+        """Check MX records and block disposables (Rule 7, 8)."""
         if not domain: return False
         domain = domain.lower().strip()
         if domain in mx_cache: return mx_cache[domain]
@@ -43,7 +43,6 @@ class DomainValidator:
             return False
 
         try:
-            # Check MX records (Rule 14)
             self.resolver.resolve(domain, 'MX')
             mx_cache[domain] = True
         except Exception:
@@ -55,9 +54,8 @@ class DomainValidator:
 def get_cleaning_expressions():
     """Initial text normalization and bug fixes (Rule 6, 10)."""
     return [
-        pl.col("email").cast(pl.String).str.strip_chars().str.to_lowercase().alias("email"),
-        # Normalize mobile symbols (Rule 9)
-        pl.col("mobile").cast(pl.String).str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
+        pl.col("email").str.strip_chars().str.to_lowercase().alias("email"),
+        pl.col("mobile").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
     ]
 
 def get_dob_age_expressions():
@@ -77,7 +75,6 @@ def get_dob_age_expressions():
     ])
 
     # 3. Fix 2-digit year (Rule 1: 90 -> 1990)
-    # Pivot year calculation based on current date
     fixed_dob = (
         pl.when(parsed_dob.dt.year() < 100)
         .then(
@@ -90,14 +87,14 @@ def get_dob_age_expressions():
         .otherwise(parsed_dob)
     )
 
-    # 4. Final Age logic (Rule 15: Age <= 40)
+    # 4. Final Age logic (Age <= 40)
     explicit_age = pl.col("age").str.extract(r"(\d+)").cast(pl.Int64)
     calculated_age = (current_year - fixed_dob.dt.year()).fill_null(dob_is_age_fallback).fill_null(explicit_age)
 
     return [calculated_age.alias("calculated_age")]
 
 def get_country_expressions():
-    """Rule 10: Handle country code and detection."""
+    """Handle country code and detection (Rule 10)."""
     return [
         # India normalization
         pl.when(pl.col("mobile").str.starts_with("91") & (pl.col("mobile").str.len_chars() == 12))
@@ -143,7 +140,7 @@ class LeadsETL:
             json.dump(list(self.processed_files), f)
 
     def map_headers(self, lf: pl.LazyFrame) -> pl.LazyFrame:
-        """Align source headers to standard internal names."""
+        """Standardizes headers and FIXES Schema Mismatch by casting ALL to String."""
         cols = lf.collect_schema().names()
         mapping = {}
         for target, synonyms in ALIASES.items():
@@ -154,13 +151,15 @@ class LeadsETL:
         if mapping:
             lf = lf.rename(mapping)
 
-        # Ensure mandatory columns exist
+        # FIX: Schema Mismatch (concat error). Cast every column to String to ensure diagonal concat works.
         current_cols = lf.collect_schema().names()
+        lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
+
+        # Ensure mandatory internal columns exist
         for col in ["email", "mobile", "dob", "age"]:
-            if col not in current_cols:
+            if col not in lf.collect_schema().names():
                 lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
-            else:
-                lf = lf.with_columns(pl.col(col).cast(pl.String))
+
         return lf
 
     def run(self):
@@ -168,16 +167,14 @@ class LeadsETL:
         to_process = [f for f in files if f not in self.processed_files]
 
         if not to_process:
-            logging.info("No new files to process.")
+            logging.info("No new files found.")
             return
 
         lazy_frames = []
-        for f in to_process:
+        for file_path in to_process:
             try:
-                # Rule 4: Handle empty files
-                lf = pl.scan_csv(f, infer_schema_length=1000, ignore_errors=True)
+                lf = pl.scan_csv(file_path, infer_schema_length=1000, ignore_errors=True)
                 if lf.collect_schema().len() == 0:
-                    logging.warning(f"Skipping empty file: {f}")
                     continue
 
                 lf = self.map_headers(lf)
@@ -185,29 +182,28 @@ class LeadsETL:
 
                 # Rule 5: Drop null/blank email OR mobile
                 lf = lf.filter(
-                    pl.col("email").is_not_null() & (pl.col("email").str.strip_chars() != "") &
-                    pl.col("mobile").is_not_null() & (pl.col("mobile").str.strip_chars() != "")
+                    pl.col("email").is_not_null() & (pl.col("email") != "") &
+                    pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
                 )
 
                 lazy_frames.append(lf)
-                # We save checkpoint after successful scan/queue
-                self._save_checkpoint(f)
+                self._save_checkpoint(file_path)
             except Exception as e:
-                logging.error(f"Error scanning {f}: {e}")
+                logging.error(f"Error scanning {file_path}: {e}")
 
         if not lazy_frames: return
 
         logging.info("Merging and processing dataset...")
-        # Rule 11, 16: Global Deduplication and Streaming
+        # Rule 11: Global Diagonal Concat (Safe now due to String casting)
         full_lf = pl.concat(lazy_frames, how="diagonal")
 
-        # Deduplicate globally AFTER normalization (Rule 11)
+        # Global Deduplication (Rule 11)
         full_lf = full_lf.unique(subset=["email"], maintain_order=True).unique(subset=["mobile"], maintain_order=True)
 
         full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
-        # Email Deliverability (Rule 14) using Global Cache (Rule 8)
+        # MX Caching deliverability check (Rule 8, 14)
         logging.info("Validating email domains via MX cache...")
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
@@ -218,35 +214,34 @@ class LeadsETL:
         )
         valid_domains = [d for d in unique_domains if self.validator.check_deliverability(d)]
 
-        # Final Rule Enforcement (Rule 9, 15)
+        # Strict Final Validation
         full_lf = full_lf.filter(
             (pl.col("calculated_age") <= 40) &
             (pl.col("email").str.extract(r"@([^@]+)$").is_in(valid_domains))
         )
 
-        # Split Outputs
+        # Country Splits
         india_lf = full_lf.filter(pl.col("detected_country") == "INDIA").filter(pl.col("norm_mobile").str.contains(r"^[6-9]\d{9}$"))
         usa_lf = full_lf.filter(pl.col("detected_country") == "USA")
 
         self.persist(india_lf, "india_leads")
         self.persist(usa_lf, "usa_leads")
 
-        logging.info("ETL Pipeline completed successfully.")
+        logging.info("Pipeline completed.")
 
     def persist(self, lf: pl.LazyFrame, name: str):
-        """Rule 3, 12, 13: Multi-format persistence with safe SQLite append."""
+        """Safe SQLite append and multi-format export."""
         db_path = self.output_dir / "leads_production.db"
         csv_path = self.output_dir / f"{name}.csv"
+        xlsx_path = self.output_dir / f"{name}.xlsx"
 
         try:
             df = lf.collect(engine="streaming")
-            if df.is_empty():
-                logging.info(f"No data for {name}, skipping export.")
-                return
+            if df.is_empty(): return
 
             df.write_csv(csv_path)
 
-            # Rule 3: SQLite Append mode safely via ADBC
+            # Rule 3: SQLite Append only
             df.write_database(
                 table_name=name,
                 connection=f"sqlite:///{db_path}",
@@ -254,18 +249,17 @@ class LeadsETL:
                 engine="adbc"
             )
 
-            # Rule 13: Excel Export (Shadow variable fix)
-            xlsx_path = self.output_dir / f"{name}.xlsx"
+            # Excel export (Rule 13)
             df.write_excel(xlsx_path)
 
             logging.info(f"Exported {name} with {len(df)} records.")
         except Exception as e:
-            logging.error(f"Persistence failed for {name}: {e}")
+            logging.error(f"Persistence error for {name}: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="India-focused Leads ETL Pipeline")
-    parser.add_argument("--input", required=True, help="Input folder with CSV files")
-    parser.add_argument("--output", required=True, help="Explicit output directory")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     LeadsETL(args.input, args.output).run()
