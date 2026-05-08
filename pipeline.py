@@ -8,6 +8,8 @@ from pathlib import Path
 import dns.resolver
 from typing import Set, Dict, List, Optional
 import argparse
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 # --- Global Configuration & Constants ---
 DISPOSABLE_DOMAINS = {
@@ -27,28 +29,111 @@ ALIASES = {
 mx_cache: Dict[str, bool] = {}
 
 class DomainValidator:
-    def __init__(self):
+    def __init__(self, max_workers: int = 50):
+        self.max_workers = max_workers
         self.resolver = dns.resolver.Resolver()
         self.resolver.lifetime = 2.0
         self.resolver.timeout = 2.0
 
-    def check_deliverability(self, domain: Optional[str]) -> bool:
-        """Check MX records and block disposables (Rule 7, 8)."""
-        if not domain: return False
-        # Remove any non-ascii artifacts that might have slipped through
-        domain = re.sub(r'[^\x20-\x7E]', '', str(domain)).lower().strip()
-        if domain in mx_cache: return mx_cache[domain]
+    def check_deliverability_single(self, domain: Optional[str]) -> tuple:
+        """Atomic check for one domain (Rule 7, 8)."""
+        if not domain: return domain, False
+        # Remove any non-ascii artifacts
+        clean_domain = re.sub(r'[^\x20-\x7E]', '', str(domain)).lower().strip()
 
-        if domain in DISPOSABLE_DOMAINS:
-            mx_cache[domain] = False
-            return False
+        if clean_domain in DISPOSABLE_DOMAINS:
+            return clean_domain, False
 
         try:
-            self.resolver.resolve(domain, 'MX')
-            mx_cache[domain] = True
+            # We use a fresh resolver per thread to avoid state issues
+            res = dns.resolver.Resolver()
+            res.lifetime = 2.0
+            res.timeout = 2.0
+            res.resolve(clean_domain, 'MX')
+            return clean_domain, True
         except Exception:
-            mx_cache[domain] = False
-        return mx_cache[domain]
+            return clean_domain, False
+
+    def validate_domains(self, domains: List[str]) -> List[str]:
+        """Parallel MX lookup using ThreadPoolExecutor (Speed optimization)."""
+        to_check = [d for d in domains if d not in mx_cache]
+        logging.info(f"Checking {len(to_check)} unique domains in parallel...")
+
+        valid_domains = [d for d in domains if mx_cache.get(d) is True]
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_domain = {executor.submit(self.check_deliverability_single, d): d for d in to_check}
+            for future in as_completed(future_to_domain):
+                domain, is_valid = future.result()
+                mx_cache[domain] = is_valid
+                if is_valid:
+                    valid_domains.append(domain)
+
+        return valid_domains
+
+# --- Standalone Worker Functions for Multiprocessing ---
+
+def process_single_file_task(file_path: str, output_dir: str):
+    """
+    Independent worker task: Scans, cleans, and saves to intermediate IPC (Feather).
+    IPC is extremely fast and preserves schema perfectly.
+    """
+    try:
+        temp_dir = Path(output_dir) / "temp_processed"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        file_name = Path(file_path).name
+        target_path = temp_dir / f"{file_name}.ipc"
+
+        # 1. Scan
+        lf = pl.scan_csv(
+            file_path,
+            encoding="utf8-lossy",
+            ignore_errors=True,
+            infer_schema_length=2000,
+            truncate_ragged_lines=True,
+            null_values=["", "NA", "N/A", "null", "NULL"]
+        )
+
+        # 2. Header Mapping (simplified for worker)
+        cols = lf.collect_schema().names()
+        mapping = {}
+        for target, synonyms in ALIASES.items():
+            match = next((c for c in cols if c.lower().replace(" ", "_") in synonyms), None)
+            if match:
+                mapping[match] = target
+
+        if mapping:
+            lf = lf.rename(mapping)
+
+        # Cast to String to prevent schema mismatch during merge
+        current_cols = lf.collect_schema().names()
+        lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
+
+        # Ensure mandatory columns
+        current_schema_cols = lf.collect_schema().names()
+        for col in ["email", "mobile", "dob", "age"]:
+            if col not in current_schema_cols:
+                lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
+
+        # 3. Clean
+        lf = lf.with_columns(get_cleaning_expressions())
+
+        # 4. Filter empty identifiers
+        lf = lf.filter(
+            pl.col("email").is_not_null() & (pl.col("email") != "") &
+            pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
+        )
+
+        # 5. Collect and Save to IPC (Rule: exec multiple files at a time)
+        df = lf.collect()
+        if not df.is_empty():
+            df.write_ipc(target_path)
+            return str(target_path)
+        return None
+
+    except Exception as e:
+        return f"ERROR: {file_path} -> {str(e)}"
 
 # --- Processing Expressions ---
 
@@ -179,45 +264,29 @@ class LeadsETL:
             logging.info("No new files found.")
             return
 
-        lazy_frames = []
-        for file_path in to_process:
-            try:
-                # FIX: Comprehensive robustness for encoding and ragged lines (Rule 17).
-                # Windows-generated CSVs often contain non-UTF8 chars and inconsistent quoting.
-                # utf8-lossy replaces invalid sequences with  instead of crashing.
-                lf = pl.scan_csv(
-                    file_path,
-                    encoding="utf8-lossy",
-                    ignore_errors=True,
-                    infer_schema_length=2000,
-                    truncate_ragged_lines=True,
-                    null_values=["", "NA", "N/A", "null", "NULL"]
-                )
+        # Phase 1: Parallel Processing (Execute multiple files at a time)
+        logging.info(f"Starting parallel processing of {len(to_process)} files...")
+        ipc_files = []
+        max_proc = min(multiprocessing.cpu_count(), len(to_process), 12) # Limit to 12 parallel pipelines
 
-                lf = self.map_headers(lf)
-                if lf is None: continue
+        with ProcessPoolExecutor(max_workers=max_proc) as executor:
+            future_to_file = {executor.submit(process_single_file_task, f, str(self.output_dir)): f for f in to_process}
+            for future in as_completed(future_to_file):
+                res = future.result()
+                orig_file = future_to_file[future]
+                if res and not res.startswith("ERROR"):
+                    ipc_files.append(res)
+                    self._save_checkpoint(orig_file)
+                else:
+                    logging.error(f"Worker failed for {orig_file}: {res}")
 
-                # Smoke test: Catch invalid UTF-8 or parsing crashes early (Rule 17)
-                lf.head(10).collect()
+        if not ipc_files:
+            logging.info("No data survived initial processing.")
+            return
 
-                lf = lf.with_columns(get_cleaning_expressions())
-
-                # Rule 5: Drop null/blank email OR mobile
-                lf = lf.filter(
-                    pl.col("email").is_not_null() & (pl.col("email") != "") &
-                    pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
-                )
-
-                lazy_frames.append(lf)
-                self._save_checkpoint(file_path)
-            except Exception as e:
-                logging.error(f"Error scanning {file_path}: {e}")
-
-        if not lazy_frames: return
-
-        logging.info("Merging and processing dataset...")
-        # Rule 11: Global Diagonal Concat (Safe now due to String casting)
-        full_lf = pl.concat(lazy_frames, how="diagonal")
+        logging.info("Merging intermediate results and applying global logic...")
+        # Rule 11: Global Diagonal Concat from IPC (extremely fast)
+        full_lf = pl.scan_ipc(ipc_files)
 
         # Global Deduplication (Rule 11)
         full_lf = full_lf.unique(subset=["email"], maintain_order=True).unique(subset=["mobile"], maintain_order=True)
@@ -225,16 +294,18 @@ class LeadsETL:
         full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
-        # MX Caching deliverability check (Rule 8, 14)
-        logging.info("Validating email domains via MX cache...")
+        # Phase 2: Optimized MX Caching deliverability check (Rule 8, 14)
+        logging.info("Extracting unique domains for parallel validation...")
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
             .unique()
-            .collect(engine="streaming") # Use streaming to handle 100M+ unique domain extraction
+            .collect(engine="streaming")
             .get_column("domain")
             .to_list()
         )
-        valid_domains = [d for d in unique_domains if self.validator.check_deliverability(d)]
+
+        # Parallel DNS validation (IO-bound speedup)
+        valid_domains = self.validator.validate_domains(unique_domains)
 
         # Strict Final Validation
         full_lf = full_lf.filter(
@@ -248,6 +319,16 @@ class LeadsETL:
 
         self.persist(india_lf, "india_leads")
         self.persist(usa_lf, "usa_leads")
+
+        # Cleanup intermediate IPC files
+        logging.info("Cleaning up intermediate files...")
+        for f in ipc_files:
+            try:
+                os.remove(f)
+            except: pass
+        try:
+            os.rmdir(self.output_dir / "temp_processed")
+        except: pass
 
         logging.info("Pipeline completed.")
 
