@@ -25,10 +25,11 @@ ALIASES = {
     "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp", "mobile_no.", "alternate_number"],
     "dob": ["dob", "date_of_birth", "birth_date", "birthday"],
     "age": ["age", "years", "current_age"],
-    "gender": ["gender", "sex", "m/f", "gen"]
+    "gender": ["gender", "sex", "m/f", "gen"],
+    "salary": ["salary", "salery", "current_salary", "ctc", "expected_salary", "salery"]
 }
 
-# Global MX Cache (Rule 8)
+# Global MX Cache
 mx_cache: Dict[str, bool] = {}
 
 class DomainValidator:
@@ -39,16 +40,14 @@ class DomainValidator:
         self.resolver.timeout = 2.0
 
     def check_deliverability_single(self, domain: Optional[str]) -> tuple:
-        """Atomic check for one domain with sanitization (Rule 7, 8)."""
+        """Atomic check for one domain with sanitization."""
         if not domain: return domain, False
-        # Remove any non-ascii artifacts that might cause DNS/UTF-8 issues
         clean_domain = re.sub(r'[^\x20-\x7E]', '', str(domain)).lower().strip()
 
         if clean_domain in DISPOSABLE_DOMAINS:
             return clean_domain, False
 
         try:
-            # Thread-safe resolver usage
             res = dns.resolver.Resolver()
             res.lifetime = 2.0
             res.timeout = 2.0
@@ -58,7 +57,7 @@ class DomainValidator:
             return clean_domain, False
 
     def validate_domains(self, domains: List[str]) -> List[str]:
-        """Parallelized MX lookup to drastically speed up processing (Rule 8, 14)."""
+        """Parallelized MX lookup to drastically speed up processing."""
         to_check = [d for d in domains if d and d not in mx_cache]
         if not to_check:
             return [d for d in domains if d and mx_cache.get(d) is True]
@@ -76,7 +75,7 @@ class DomainValidator:
 # --- Standalone Worker Functions ---
 
 def get_cleaning_expressions():
-    """Identifier normalization logic shared across processes (Rule 6)."""
+    """Identifier normalization logic shared across processes."""
     return [
         pl.col("email").str.replace_all(r"[^\x20-\x7E]", "").str.strip_chars().str.to_lowercase().alias("email"),
         pl.col("mobile").str.replace_all(r"[^\x20-\x7E]", "").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
@@ -94,7 +93,7 @@ def process_single_file_task(file_path: str, output_dir: str):
         file_name = Path(file_path).name
         target_path = temp_dir / f"{file_name}.ipc"
 
-        # 1. Scan with high tolerance for encoding/structure issues (Rule 17)
+        # 1. Scan with high tolerance for encoding/structure issues
         lf = pl.scan_csv(
             file_path,
             encoding="utf8-lossy",
@@ -104,15 +103,13 @@ def process_single_file_task(file_path: str, output_dir: str):
             null_values=["", "NA", "N/A", "null", "NULL"]
         )
 
-        # 2. Schema Alignment & Header Normalization (Fix for Case Sensitivity/Schema mismatch)
+        # 2. Schema Alignment & Header Normalization
         orig_cols = lf.collect_schema().names()
-        # Standardize to lowercase headers to avoid case-sensitivity issues in DB
         lf = lf.rename({c: c.lower() for c in orig_cols})
         cols = [c.lower() for c in orig_cols]
 
         mapping = {}
         for target, synonyms in ALIASES.items():
-            # Robust mapping for varying header styles (spaces, dots to underscores)
             match = next((c for c in cols if c.replace(" ", "_").replace(".", "_") in synonyms), None)
             if match:
                 mapping[match] = target
@@ -120,25 +117,23 @@ def process_single_file_task(file_path: str, output_dir: str):
         if mapping:
             lf = lf.rename(mapping)
 
-        # Cast ALL columns to String to ensure diagonal concat succeeds without schema errors
+        # Cast ALL columns to String for safety
         current_cols = lf.collect_schema().names()
         lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
 
-        # Ensure mandatory columns exist for logical consistency (including gender)
-        for col in ["email", "mobile", "dob", "age", "gender"]:
+        # Ensure mandatory columns exist
+        for col in ["email", "mobile", "dob", "age", "gender", "salary"]:
             if col not in lf.collect_schema().names():
                 lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
 
-        # 3. Apply cleaning logic
         lf = lf.with_columns(get_cleaning_expressions())
 
-        # 4. Mandatory column filter (Email/Mobile non-empty) (Rule 5)
+        # Mandatory filter
         lf = lf.filter(
             pl.col("email").is_not_null() & (pl.col("email") != "") &
             pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
         )
 
-        # 5. Save to binary IPC for extremely fast aggregation in main process
         df = lf.collect()
         if not df.is_empty():
             df.write_ipc(target_path)
@@ -151,10 +146,9 @@ def process_single_file_task(file_path: str, output_dir: str):
 # --- Global Aggregation Logic ---
 
 def get_dob_age_expressions():
-    """Production-grade DOB parsing and 2-digit year correction (Rule 1, 2)."""
+    """Production-grade DOB parsing and 2-digit year correction."""
     current_year = datetime.now().year
 
-    # Handle numeric age in DOB column (Rule 2)
     dob_as_numeric = pl.col("dob").str.extract(r"^(\d{1,3})$").cast(pl.Int64)
     dob_is_age_fallback = pl.when(dob_as_numeric <= 100).then(dob_as_numeric).otherwise(None)
 
@@ -165,7 +159,6 @@ def get_dob_age_expressions():
         pl.col("dob").str.to_date("%d/%m/%y", strict=False),
     ])
 
-    # Pivot logic: 90 -> 1990 (Rule 1)
     fixed_dob = (
         pl.when(parsed_dob.dt.year() < 100)
         .then(
@@ -184,7 +177,7 @@ def get_dob_age_expressions():
     return [calculated_age.cast(pl.Int64).alias("calculated_age")]
 
 def get_country_expressions():
-    """Detect and normalize country-specific data (Rule 10)."""
+    """Detect and normalize country-specific data."""
     return [
         pl.when(pl.col("mobile").str.starts_with("91") & (pl.col("mobile").str.len_chars() == 12))
         .then(pl.col("mobile").str.slice(2))
@@ -238,7 +231,7 @@ class LeadsETL:
             logging.info("No new files found for processing.")
             return
 
-        # Phase 1: High-Speed Parallel File Processing
+        # Phase 1: Parallel Processing
         logging.info(f"Starting parallel processing of {len(to_process)} files...")
         ipc_files = []
         max_proc = min(multiprocessing.cpu_count(), len(to_process), 12)
@@ -255,20 +248,21 @@ class LeadsETL:
                     logging.error(f"Worker failed for {orig_file}: {res}")
 
         if not ipc_files:
-            logging.info("Initial processing phase produced no output data.")
+            logging.info("Initial phase produced no output data.")
             return
 
         # Phase 2: Global Logic & Deduplication
         logging.info("Merging intermediate results and applying global logic...")
-        full_lf = pl.scan_ipc(ipc_files)
+        # FIX: heterogeneous schema merge error. Use diagonal concat for IPC files.
+        full_lf = pl.concat([pl.scan_ipc(f) for f in ipc_files], how="diagonal")
 
-        # Global uniqueness on Email/Mobile (Rule 11)
+        # Deduplication
         full_lf = full_lf.unique(subset=["email"], maintain_order=True).unique(subset=["mobile"], maintain_order=True)
 
         full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
-        # Parallelized Deliverability Check (Rule 14)
+        # Parallelized Deliverability Check
         logging.info("Extracting unique domains for parallel validation...")
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
@@ -280,13 +274,11 @@ class LeadsETL:
 
         valid_domains = self.validator.validate_domains(unique_domains)
 
-        # Enforce Age and Deliverability rules (Rule 15)
         full_lf = full_lf.filter(
             (pl.col("calculated_age") <= 40) &
             (pl.col("email").str.extract(r"@([^@]+)$").is_in(valid_domains))
         )
 
-        # Country Splits
         india_lf = full_lf.filter(pl.col("detected_country") == "INDIA").filter(pl.col("norm_mobile").str.contains(r"^[6-9]\d{9}$"))
         usa_lf = full_lf.filter(pl.col("detected_country") == "USA")
 
@@ -305,7 +297,7 @@ class LeadsETL:
         logging.info("Pipeline completed successfully.")
 
     def _sync_schema_and_collect(self, lf: pl.LazyFrame, table_name: str, db_path: Path) -> pl.DataFrame:
-        """Robustly synchronizes DataFrame and SQLite schemas to prevent append errors (Rule 3)."""
+        """Bidirectional synchronization between DF and SQLite schemas."""
         df = lf.collect(engine="streaming")
         if df.is_empty() or not db_path.exists():
             return df
@@ -313,56 +305,49 @@ class LeadsETL:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         try:
-            # 1. Get exact casing and existence from sqlite_master
             cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
             db_table_match = cursor.fetchone()
             if not db_table_match:
-                return df # write_database will create it
+                return df
 
             real_table_name = db_table_match[0]
-
-            # 2. Inspect DB columns
             cursor.execute(f'PRAGMA table_info("{real_table_name}")')
             db_cols = {row[1] for row in cursor.fetchall()}
 
-            # 3. Add missing columns to DB (Schema Evolution)
+            # Evolve DB schema
             for col in df.columns:
                 if col not in db_cols:
-                    logging.info(f"Evolving DB schema: Adding column [{col}] to table [{real_table_name}]")
+                    logging.info(f"Evolving DB schema: Adding [{col}] to [{real_table_name}]")
                     cursor.execute(f'ALTER TABLE "{real_table_name}" ADD COLUMN "{col}" TEXT')
             conn.commit()
 
-            # 4. Synchronize DF to match DB exactly (column set and order)
+            # Evolve DF schema
             cursor.execute(f'PRAGMA table_info("{real_table_name}")')
             final_db_cols = [row[1] for row in cursor.fetchall()]
-
             missing_in_df = [col for col in final_db_cols if col not in df.columns]
             if missing_in_df:
                 df = df.with_columns([pl.lit(None).cast(pl.String).alias(col) for col in missing_in_df])
 
-            # Ensure order matches PRAGMA info exactly for ADBC
             df = df.select(final_db_cols)
 
         except Exception as e:
-            logging.error(f"Schema synchronization CRITICAL error for {table_name}: {e}")
+            logging.error(f"Schema sync critical error for {table_name}: {e}")
         finally:
             conn.close()
         return df
 
     def persist(self, lf: pl.LazyFrame, name: str):
-        """High-performance persistence with bidirectional schema synchronization."""
+        """Multi-format persistence with schema safety."""
         db_path = self.output_dir / "leads_production.db"
         csv_path = self.output_dir / f"{name}.csv"
         xlsx_path = self.output_dir / f"{name}.xlsx"
 
         try:
-            # Sync DF and DB schemas before collection to fix 'did not find column' error
             df = self._sync_schema_and_collect(lf, name, db_path)
             if df.is_empty(): return
 
             df.write_csv(csv_path)
 
-            # SQLite Append only (Rule 3)
             df.write_database(
                 table_name=name,
                 connection=f"sqlite:///{db_path}",
@@ -370,11 +355,8 @@ class LeadsETL:
                 engine="adbc"
             )
 
-            # Excel export with row limit safety (Rule 13)
             if len(df) <= 1048575:
                 df.write_excel(xlsx_path)
-            else:
-                logging.warning(f"Skipping Excel for {name}: {len(df)} rows exceeds limit.")
 
             logging.info(f"Successfully exported {name}: {len(df)} records.")
         except Exception as e:
