@@ -32,10 +32,11 @@ class DomainValidator:
         self.resolver.lifetime = 2.0
         self.resolver.timeout = 2.0
 
-    def check_deliverability(self, domain: str) -> bool:
+    def check_deliverability(self, domain: Optional[str]) -> bool:
         """Check MX records and block disposables (Rule 7, 8)."""
         if not domain: return False
-        domain = domain.lower().strip()
+        # Remove any non-ascii artifacts that might have slipped through
+        domain = re.sub(r'[^\x20-\x7E]', '', str(domain)).lower().strip()
         if domain in mx_cache: return mx_cache[domain]
 
         if domain in DISPOSABLE_DOMAINS:
@@ -54,8 +55,9 @@ class DomainValidator:
 def get_cleaning_expressions():
     """Initial text normalization and bug fixes (Rule 6, 10)."""
     return [
-        pl.col("email").str.strip_chars().str.to_lowercase().alias("email"),
-        pl.col("mobile").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
+        # Scrub non-printable/non-UTF8 characters that cause crashes during collect (Rule 17)
+        pl.col("email").str.replace_all(r"[^\x20-\x7E]", "").str.strip_chars().str.to_lowercase().alias("email"),
+        pl.col("mobile").str.replace_all(r"[^\x20-\x7E]", "").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
     ]
 
 def get_dob_age_expressions():
@@ -139,9 +141,15 @@ class LeadsETL:
         with open(self.checkpoint_file, "w") as f:
             json.dump(list(self.processed_files), f)
 
-    def map_headers(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+    def map_headers(self, lf: pl.LazyFrame) -> Optional[pl.LazyFrame]:
         """Standardizes headers and FIXES Schema Mismatch by casting ALL to String."""
-        cols = lf.collect_schema().names()
+        try:
+            schema = lf.collect_schema()
+            cols = schema.names()
+        except Exception as e:
+            logging.error(f"Schema resolution failed (likely corrupt file): {e}")
+            return None
+
         mapping = {}
         for target, synonyms in ALIASES.items():
             match = next((c for c in cols if c.lower().replace(" ", "_") in synonyms), None)
@@ -156,8 +164,9 @@ class LeadsETL:
         lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
 
         # Ensure mandatory internal columns exist
+        current_schema_cols = lf.collect_schema().names()
         for col in ["email", "mobile", "dob", "age"]:
-            if col not in lf.collect_schema().names():
+            if col not in current_schema_cols:
                 lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
 
         return lf
@@ -173,11 +182,24 @@ class LeadsETL:
         lazy_frames = []
         for file_path in to_process:
             try:
-                lf = pl.scan_csv(file_path, infer_schema_length=1000, ignore_errors=True)
-                if lf.collect_schema().len() == 0:
-                    continue
+                # FIX: Comprehensive robustness for encoding and ragged lines (Rule 17).
+                # Windows-generated CSVs often contain non-UTF8 chars and inconsistent quoting.
+                # utf8-lossy replaces invalid sequences with  instead of crashing.
+                lf = pl.scan_csv(
+                    file_path,
+                    encoding="utf8-lossy",
+                    ignore_errors=True,
+                    infer_schema_length=2000,
+                    truncate_ragged_lines=True,
+                    null_values=["", "NA", "N/A", "null", "NULL"]
+                )
 
                 lf = self.map_headers(lf)
+                if lf is None: continue
+
+                # Smoke test: Catch invalid UTF-8 or parsing crashes early (Rule 17)
+                lf.head(10).collect()
+
                 lf = lf.with_columns(get_cleaning_expressions())
 
                 # Rule 5: Drop null/blank email OR mobile
@@ -208,7 +230,7 @@ class LeadsETL:
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
             .unique()
-            .collect()
+            .collect(engine="streaming") # Use streaming to handle 100M+ unique domain extraction
             .get_column("domain")
             .to_list()
         )
