@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import re
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 import dns.resolver
@@ -18,14 +19,15 @@ DISPOSABLE_DOMAINS = {
     "disposable.com", "guerrillamail.biz", "guerrillamail.org"
 }
 
+# Standardized column aliases for heterogeneous CSV headers
 ALIASES = {
-    "email": ["email", "e-mail", "mail_id", "email_address", "user_email", "email_id"],
+    "email": ["email", "e-mail", "mail_id", "email_address", "user_email", "email_id", "email_address"],
     "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp", "mobile_no.", "alternate_number"],
     "dob": ["dob", "date_of_birth", "birth_date", "birthday"],
     "age": ["age", "years", "current_age"]
 }
 
-# Global MX Cache (Rule 8)
+# Global MX Cache (utilized in Phase 2)
 mx_cache: Dict[str, bool] = {}
 
 class DomainValidator:
@@ -36,16 +38,16 @@ class DomainValidator:
         self.resolver.timeout = 2.0
 
     def check_deliverability_single(self, domain: Optional[str]) -> tuple:
-        """Atomic check for one domain (Rule 7, 8)."""
+        """Atomic check for one domain with sanitization."""
         if not domain: return domain, False
-        # Remove any non-ascii artifacts
+        # Remove any non-ascii artifacts that might cause DNS/UTF-8 issues
         clean_domain = re.sub(r'[^\x20-\x7E]', '', str(domain)).lower().strip()
 
         if clean_domain in DISPOSABLE_DOMAINS:
             return clean_domain, False
 
         try:
-            # We use a fresh resolver per thread to avoid state issues
+            # Thread-safe resolver usage
             res = dns.resolver.Resolver()
             res.lifetime = 2.0
             res.timeout = 2.0
@@ -55,11 +57,11 @@ class DomainValidator:
             return clean_domain, False
 
     def validate_domains(self, domains: List[str]) -> List[str]:
-        """Parallel MX lookup using ThreadPoolExecutor (Speed optimization)."""
-        to_check = [d for d in domains if d not in mx_cache]
+        """Parallelized MX lookup to drastically speed up processing."""
+        to_check = [d for d in domains if d and d not in mx_cache]
         logging.info(f"Checking {len(to_check)} unique domains in parallel...")
 
-        valid_domains = [d for d in domains if mx_cache.get(d) is True]
+        valid_domains = [d for d in domains if d and mx_cache.get(d) is True]
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_domain = {executor.submit(self.check_deliverability_single, d): d for d in to_check}
@@ -71,12 +73,19 @@ class DomainValidator:
 
         return valid_domains
 
-# --- Standalone Worker Functions for Multiprocessing ---
+# --- Standalone Worker Functions ---
+
+def get_cleaning_expressions():
+    """Identifier normalization logic shared across processes."""
+    return [
+        pl.col("email").str.replace_all(r"[^\x20-\x7E]", "").str.strip_chars().str.to_lowercase().alias("email"),
+        pl.col("mobile").str.replace_all(r"[^\x20-\x7E]", "").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
+    ]
 
 def process_single_file_task(file_path: str, output_dir: str):
     """
-    Independent worker task: Scans, cleans, and saves to intermediate IPC (Feather).
-    IPC is extremely fast and preserves schema perfectly.
+    Independent worker task for Multiprocessing.
+    Handles: Scanning, schema normalization, type casting, and intermediate persistence.
     """
     try:
         temp_dir = Path(output_dir) / "temp_processed"
@@ -85,7 +94,7 @@ def process_single_file_task(file_path: str, output_dir: str):
         file_name = Path(file_path).name
         target_path = temp_dir / f"{file_name}.ipc"
 
-        # 1. Scan
+        # 1. Scan with high tolerance for encoding/structure issues
         lf = pl.scan_csv(
             file_path,
             encoding="utf8-lossy",
@@ -95,37 +104,37 @@ def process_single_file_task(file_path: str, output_dir: str):
             null_values=["", "NA", "N/A", "null", "NULL"]
         )
 
-        # 2. Header Mapping (simplified for worker)
+        # 2. Schema Alignment
         cols = lf.collect_schema().names()
         mapping = {}
         for target, synonyms in ALIASES.items():
-            match = next((c for c in cols if c.lower().replace(" ", "_") in synonyms), None)
+            # Robust mapping for varying header styles
+            match = next((c for c in cols if c.lower().replace(" ", "_").replace(".", "_") in synonyms), None)
             if match:
                 mapping[match] = target
 
         if mapping:
             lf = lf.rename(mapping)
 
-        # Cast to String to prevent schema mismatch during merge
+        # Cast ALL columns to String to ensure diagonal concat succeeds without schema errors
         current_cols = lf.collect_schema().names()
         lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
 
-        # Ensure mandatory columns
-        current_schema_cols = lf.collect_schema().names()
+        # Ensure standard columns exist for logical consistency
         for col in ["email", "mobile", "dob", "age"]:
-            if col not in current_schema_cols:
+            if col not in lf.collect_schema().names():
                 lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
 
-        # 3. Clean
+        # 3. Apply cleaning logic
         lf = lf.with_columns(get_cleaning_expressions())
 
-        # 4. Filter empty identifiers
+        # 4. Mandatory column filter (Email/Mobile non-empty)
         lf = lf.filter(
             pl.col("email").is_not_null() & (pl.col("email") != "") &
             pl.col("mobile").is_not_null() & (pl.col("mobile") != "")
         )
 
-        # 5. Collect and Save to IPC (Rule: exec multiple files at a time)
+        # 5. Save to binary IPC for extremely fast aggregation in main process
         df = lf.collect()
         if not df.is_empty():
             df.write_ipc(target_path)
@@ -135,25 +144,15 @@ def process_single_file_task(file_path: str, output_dir: str):
     except Exception as e:
         return f"ERROR: {file_path} -> {str(e)}"
 
-# --- Processing Expressions ---
-
-def get_cleaning_expressions():
-    """Initial text normalization and bug fixes (Rule 6, 10)."""
-    return [
-        # Scrub non-printable/non-UTF8 characters that cause crashes during collect (Rule 17)
-        pl.col("email").str.replace_all(r"[^\x20-\x7E]", "").str.strip_chars().str.to_lowercase().alias("email"),
-        pl.col("mobile").str.replace_all(r"[^\x20-\x7E]", "").str.replace_all(r"[\s\+\-\(\)\[\]]", "").alias("mobile")
-    ]
+# --- Global Aggregation Logic ---
 
 def get_dob_age_expressions():
-    """Fixes 2-digit years and numeric age bug (Rule 1, 2)."""
+    """Production-grade DOB parsing and 2-digit year correction."""
     current_year = datetime.now().year
 
-    # 1. Detect if DOB is actually an age (Numeric <= 100) (Rule 2)
     dob_as_numeric = pl.col("dob").str.extract(r"^(\d{1,3})$").cast(pl.Int64)
     dob_is_age_fallback = pl.when(dob_as_numeric <= 100).then(dob_as_numeric).otherwise(None)
 
-    # 2. Parse DOB formats safely
     parsed_dob = pl.coalesce([
         pl.col("dob").str.to_date("%d/%m/%Y", strict=False),
         pl.col("dob").str.to_date("%Y-%m-%d", strict=False),
@@ -161,7 +160,7 @@ def get_dob_age_expressions():
         pl.col("dob").str.to_date("%d/%m/%y", strict=False),
     ])
 
-    # 3. Fix 2-digit year (Rule 1: 90 -> 1990)
+    # Pivot logic: 90 -> 1990
     fixed_dob = (
         pl.when(parsed_dob.dt.year() < 100)
         .then(
@@ -174,16 +173,14 @@ def get_dob_age_expressions():
         .otherwise(parsed_dob)
     )
 
-    # 4. Final Age logic (Age <= 40)
     explicit_age = pl.col("age").str.extract(r"(\d+)").cast(pl.Int64)
     calculated_age = (current_year - fixed_dob.dt.year()).fill_null(dob_is_age_fallback).fill_null(explicit_age)
 
     return [calculated_age.alias("calculated_age")]
 
 def get_country_expressions():
-    """Handle country code and detection (Rule 10)."""
+    """Detect and normalize country-specific data (India/USA)."""
     return [
-        # India normalization
         pl.when(pl.col("mobile").str.starts_with("91") & (pl.col("mobile").str.len_chars() == 12))
         .then(pl.col("mobile").str.slice(2))
         .otherwise(pl.col("mobile"))
@@ -197,7 +194,7 @@ def get_country_expressions():
         .alias("detected_country")
     ]
 
-# --- Pipeline Class ---
+# --- Pipeline Main Class ---
 
 class LeadsETL:
     def __init__(self, input_path: str, output_path: str):
@@ -226,75 +223,45 @@ class LeadsETL:
         with open(self.checkpoint_file, "w") as f:
             json.dump(list(self.processed_files), f)
 
-    def map_headers(self, lf: pl.LazyFrame) -> Optional[pl.LazyFrame]:
-        """Standardizes headers and FIXES Schema Mismatch by casting ALL to String."""
-        try:
-            schema = lf.collect_schema()
-            cols = schema.names()
-        except Exception as e:
-            logging.error(f"Schema resolution failed (likely corrupt file): {e}")
-            return None
-
-        mapping = {}
-        for target, synonyms in ALIASES.items():
-            match = next((c for c in cols if c.lower().replace(" ", "_") in synonyms), None)
-            if match:
-                mapping[match] = target
-
-        if mapping:
-            lf = lf.rename(mapping)
-
-        # FIX: Schema Mismatch (concat error). Cast every column to String to ensure diagonal concat works.
-        current_cols = lf.collect_schema().names()
-        lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
-
-        # Ensure mandatory internal columns exist
-        current_schema_cols = lf.collect_schema().names()
-        for col in ["email", "mobile", "dob", "age"]:
-            if col not in current_schema_cols:
-                lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
-
-        return lf
-
     def run(self):
         files = sorted([str(f) for f in self.input_dir.glob("*.csv")])
         to_process = [f for f in files if f not in self.processed_files]
 
         if not to_process:
-            logging.info("No new files found.")
+            logging.info("No new files to process.")
             return
 
-        # Phase 1: Parallel Processing (Execute multiple files at a time)
+        # Phase 1: High-Speed Parallel File Processing
         logging.info(f"Starting parallel processing of {len(to_process)} files...")
         ipc_files = []
-        max_proc = min(multiprocessing.cpu_count(), len(to_process), 12) # Limit to 12 parallel pipelines
+        max_proc = min(multiprocessing.cpu_count(), len(to_process), 12)
 
         with ProcessPoolExecutor(max_workers=max_proc) as executor:
             future_to_file = {executor.submit(process_single_file_task, f, str(self.output_dir)): f for f in to_process}
             for future in as_completed(future_to_file):
                 res = future.result()
                 orig_file = future_to_file[future]
-                if res and not res.startswith("ERROR"):
+                if res and not str(res).startswith("ERROR"):
                     ipc_files.append(res)
                     self._save_checkpoint(orig_file)
                 else:
                     logging.error(f"Worker failed for {orig_file}: {res}")
 
         if not ipc_files:
-            logging.info("No data survived initial processing.")
+            logging.info("Initial processing phase produced no output data.")
             return
 
+        # Phase 2: Global Logic & Deduplication
         logging.info("Merging intermediate results and applying global logic...")
-        # Rule 11: Global Diagonal Concat from IPC (extremely fast)
         full_lf = pl.scan_ipc(ipc_files)
 
-        # Global Deduplication (Rule 11)
+        # Global uniqueness on Email/Mobile
         full_lf = full_lf.unique(subset=["email"], maintain_order=True).unique(subset=["mobile"], maintain_order=True)
 
         full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
-        # Phase 2: Optimized MX Caching deliverability check (Rule 8, 14)
+        # Parallelized Deliverability Check
         logging.info("Extracting unique domains for parallel validation...")
         unique_domains = (
             full_lf.select(domain=pl.col("email").str.extract(r"@([^@]+)$"))
@@ -304,36 +271,56 @@ class LeadsETL:
             .to_list()
         )
 
-        # Parallel DNS validation (IO-bound speedup)
         valid_domains = self.validator.validate_domains(unique_domains)
 
-        # Strict Final Validation
+        # Enforce Age and Deliverability rules
         full_lf = full_lf.filter(
             (pl.col("calculated_age") <= 40) &
             (pl.col("email").str.extract(r"@([^@]+)$").is_in(valid_domains))
         )
 
-        # Country Splits
+        # Splitting
         india_lf = full_lf.filter(pl.col("detected_country") == "INDIA").filter(pl.col("norm_mobile").str.contains(r"^[6-9]\d{9}$"))
         usa_lf = full_lf.filter(pl.col("detected_country") == "USA")
 
+        # Persistence
         self.persist(india_lf, "india_leads")
         self.persist(usa_lf, "usa_leads")
 
-        # Cleanup intermediate IPC files
+        # Cleanup
         logging.info("Cleaning up intermediate files...")
         for f in ipc_files:
-            try:
-                os.remove(f)
+            try: os.remove(f)
             except: pass
-        try:
-            os.rmdir(self.output_dir / "temp_processed")
+        try: os.rmdir(self.output_dir / "temp_processed")
         except: pass
 
-        logging.info("Pipeline completed.")
+        logging.info("Pipeline completed successfully.")
+
+    def _ensure_sqlite_schema(self, df: pl.DataFrame, table_name: str, db_path: Path):
+        """Fixes 'did not find column' error by auto-evolving SQLite schema (Rule 3)."""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            if not cursor.fetchone(): return # Table creation will happen in write_database
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+
+            for col in df.columns:
+                if col not in existing_cols:
+                    logging.info(f"Evolving schema: Adding column [{col}] to SQLite table [{table_name}]")
+                    # SQLite requires quoting identifiers to handle special characters in headers
+                    cursor.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" TEXT')
+            conn.commit()
+        except Exception as e:
+            logging.warning(f"Schema evolution failed for {table_name}: {e}")
+        finally:
+            conn.close()
 
     def persist(self, lf: pl.LazyFrame, name: str):
-        """Safe SQLite append and multi-format export."""
+        """Robust persistence with schema evolution and multi-format support."""
         db_path = self.output_dir / "leads_production.db"
         csv_path = self.output_dir / f"{name}.csv"
         xlsx_path = self.output_dir / f"{name}.xlsx"
@@ -344,7 +331,11 @@ class LeadsETL:
 
             df.write_csv(csv_path)
 
-            # Rule 3: SQLite Append only
+            # Auto-evolve SQLite schema if table exists but new columns are detected
+            if db_path.exists():
+                self._ensure_sqlite_schema(df, name, db_path)
+
+            # High-performance append via ADBC
             df.write_database(
                 table_name=name,
                 connection=f"sqlite:///{db_path}",
@@ -352,10 +343,10 @@ class LeadsETL:
                 engine="adbc"
             )
 
-            # Excel export (Rule 13)
+            # Safe Excel export
             df.write_excel(xlsx_path)
 
-            logging.info(f"Exported {name} with {len(df)} records.")
+            logging.info(f"Exported {name}: {len(df)} records.")
         except Exception as e:
             logging.error(f"Persistence error for {name}: {e}")
 
