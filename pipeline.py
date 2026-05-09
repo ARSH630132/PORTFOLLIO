@@ -31,8 +31,6 @@ DISPOSABLE_DOMAINS = {
 ALIASES = {
     "email": ["email", "e-mail", "mail_id", "email_address", "user_email", "email_id"],
     "mobile": ["mobile", "phone", "contact", "mobile_number", "phone_number", "cell", "whatsapp", "mobile_no.", "alternate_number"],
-    "dob": ["dob", "date_of_birth", "birth_date", "birthday"],
-    "age": ["age", "years", "current_age"],
     "gender": ["gender", "sex", "m/f", "gen"],
     "salary": ["salary", "salery", "current_salary", "ctc", "expected_salary"]
 }
@@ -138,7 +136,7 @@ def process_single_file_task(file_path: str, output_dir: str):
         lf = lf.with_columns([pl.col(c).cast(pl.String) for c in current_cols])
 
         # Ensure mandatory columns exist
-        for col in ["email", "mobile", "dob", "age", "gender", "salary"]:
+        for col in ["email", "mobile", "gender", "salary"]:
             if col not in lf.collect_schema().names():
                 lf = lf.with_columns(pl.lit(None).cast(pl.String).alias(col))
 
@@ -160,38 +158,6 @@ def process_single_file_task(file_path: str, output_dir: str):
         return f"ERROR: {file_path} -> {str(e)}"
 
 # --- Global Aggregation Logic ---
-
-def get_dob_age_expressions():
-    """Production-grade DOB parsing and 2-digit year correction."""
-    current_year = datetime.now().year
-
-    dob_as_numeric = pl.col("dob").str.extract(r"^(\d{1,3})$").cast(pl.Int64)
-    dob_is_age_fallback = pl.when(dob_as_numeric <= 100).then(dob_as_numeric).otherwise(None)
-
-    parsed_dob = pl.coalesce([
-        pl.col("dob").str.to_date("%d/%m/%Y", strict=False),
-        pl.col("dob").str.to_date("%Y-%m-%d", strict=False),
-        pl.col("dob").str.to_date("%d-%m-%Y", strict=False),
-        pl.col("dob").str.to_date("%d/%m/%y", strict=False),
-    ])
-
-    # Pivot logic: 90 -> 1990
-    fixed_dob = (
-        pl.when(parsed_dob.dt.year() < 100)
-        .then(
-            pl.when(parsed_dob.dt.year() + 2000 > current_year)
-            .then(parsed_dob.dt.offset_by("1900y"))
-            .otherwise(parsed_dob.dt.offset_by("2000y"))
-        )
-        .when(parsed_dob.dt.year() > current_year)
-        .then(parsed_dob.dt.offset_by("-100y"))
-        .otherwise(parsed_dob)
-    )
-
-    explicit_age = pl.col("age").str.extract(r"(\d+)").cast(pl.Int64)
-    calculated_age = (current_year - fixed_dob.dt.year()).fill_null(dob_is_age_fallback).fill_null(explicit_age)
-
-    return [calculated_age.cast(pl.Int64).alias("calculated_age")]
 
 def get_country_expressions():
     """Detect and normalize country-specific data."""
@@ -281,7 +247,6 @@ class LeadsETL:
         # Deduplication
         full_lf = full_lf.unique(subset=["email"], maintain_order=True).unique(subset=["mobile"], maintain_order=True)
 
-        full_lf = full_lf.with_columns(get_dob_age_expressions())
         full_lf = full_lf.with_columns(get_country_expressions())
 
         logging.info("Extracting unique domains for parallel validation...")
