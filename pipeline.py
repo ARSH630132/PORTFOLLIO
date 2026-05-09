@@ -295,9 +295,9 @@ class LeadsETL:
 
         valid_domains = self.validator.validate_domains(unique_domains)
 
+        # Enforce Deliverability rules (Age filtering removed as per requirement)
         full_lf = full_lf.filter(
-            (pl.col("calculated_age") <= 40) &
-            (pl.col("email").str.extract(r"@([^@]+)$").is_in(valid_domains))
+            pl.col("email").str.extract(r"@([^@]+)$").is_in(valid_domains)
         )
 
         india_lf = full_lf.filter(pl.col("detected_country") == "INDIA").filter(pl.col("norm_mobile").str.contains(r"^[6-9]\d{9}$"))
