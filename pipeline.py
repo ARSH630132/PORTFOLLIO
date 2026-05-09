@@ -113,7 +113,8 @@ def process_single_file_task(file_path: str, output_dir: str):
         elif ext in ['.xlsx', '.xls']:
             # Excel files are read into memory first, then converted to LazyFrame
             # Note: requires 'fastexcel' or 'calamine' engine
-            df_excel = pl.read_excel(file_path)
+            # FIX: Handle Excel formula errors (#NAME?) and large mobile numbers by casting everything to String early.
+            df_excel = pl.read_excel(file_path, infer_schema_length=0)
             lf = df_excel.lazy()
         else:
             return f"ERROR: Unsupported extension {ext} for {file_path}"
